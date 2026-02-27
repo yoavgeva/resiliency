@@ -299,8 +299,8 @@ SingleFlight, you hit the database 50 times. With it, you hit it once:
   end)
 ```
 
-All 50 callers block until the single execution completes, then they all
-receive `{:ok, %{id: 42, ...}}`.
+All 50 callers skip the I/O -- they wait for the single execution to complete,
+then receive `{:ok, %{id: 42, ...}}` without each doing their own round-trip.
 
 ### 3. Forget a key
 

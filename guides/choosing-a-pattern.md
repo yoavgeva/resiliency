@@ -87,8 +87,8 @@ end)
 Key traits:
 
 - Reduces load -- N concurrent callers produce exactly 1 execution.
-- Adds latency for callers that arrive after the first; they block until it
-  completes.
+- Saves latency for callers that arrive after the first -- they skip the I/O
+  entirely and receive the result as soon as the in-flight call completes.
 - Stateful -- requires a `GenServer`.
 
 ---
@@ -177,7 +177,7 @@ Key traits:
 |---|---|---|---|---|---|
 | `BackoffRetry` | Transient failures | Yes -- backoff delays between attempts | No -- sequential attempts | No | HTTP calls, database queries, anything with intermittent errors |
 | `Hedged` | Tail latency | No -- reduces p99 | Yes -- fires extra requests | Adaptive: yes; Stateless: no | Latency-sensitive RPCs, fan-out queries, cache lookups |
-| `SingleFlight` | Thundering herd / duplicate work | For late arrivals -- they block on the in-flight call | No -- reduces load by deduplication | Yes | Cache population, config reloads, expensive computations with shared keys |
+| `SingleFlight` | Thundering herd / duplicate work | No -- late arrivals skip the I/O and share the result | No -- reduces load by deduplication | Yes | Cache population, config reloads, expensive computations with shared keys |
 | `WeightedSemaphore` | Unbounded concurrency | When saturated -- callers queue | No -- caps it | Yes | Database pools, API rate limits, disk I/O, GPU access |
 | `TaskExtension.race` | Need the fastest result from N sources | No -- returns the first success | Yes -- runs all concurrently | No | Multi-region fetch, redundant providers |
 | `TaskExtension.map` | Parallel processing with a concurrency cap | No (unless saturated) | Bounded by `max_concurrency` | No | Bulk HTTP fetches, batch processing |
