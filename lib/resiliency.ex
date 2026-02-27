@@ -2,12 +2,13 @@ defmodule Resiliency do
   @moduledoc """
   Resilience and concurrency toolkit for Elixir.
 
-  This library bundles five complementary modules that help your application
+  This library bundles six complementary modules that help your application
   handle failures, bound concurrency, and reduce tail latency — all with
   zero runtime dependencies.
 
   ## Modules
 
+    * `Resiliency.CircuitBreaker` — Circuit breaker with sliding window failure-rate tracking and automatic recovery.
     * `Resiliency.BackoffRetry` — Functional retry with composable, stream-based backoff strategies.
     * `Resiliency.Hedged` — Hedged requests: fire a backup after a delay, take whichever finishes first.
     * `Resiliency.SingleFlight` — Deduplicate concurrent function calls by key.
@@ -22,9 +23,10 @@ defmodule Resiliency do
   Most modules in this library follow a consistent workflow:
 
   1. **Start** — Add the module to your supervision tree (where applicable).
-     Only `Resiliency.Hedged` (adaptive mode), `Resiliency.SingleFlight`, and
-     `Resiliency.WeightedSemaphore` require a running process. `BackoffRetry`,
-     `Race`, `AllSettled`, `Map`, `FirstOk`, and stateless `Hedged.run/2` are purely functional.
+     `Resiliency.CircuitBreaker`, `Resiliency.Hedged` (adaptive mode),
+     `Resiliency.SingleFlight`, and `Resiliency.WeightedSemaphore` require a
+     running process. `BackoffRetry`, `Race`, `AllSettled`, `Map`, `FirstOk`,
+     and stateless `Hedged.run/2` are purely functional.
 
   2. **Call** — Wrap your operation in a zero-arity function and pass it to the
      module's primary entry point:
@@ -46,6 +48,9 @@ defmodule Resiliency do
 
          # WeightedSemaphore
          Resiliency.WeightedSemaphore.acquire(MySem, 3, fn -> bulk_insert(rows) end)
+
+         # CircuitBreaker
+         Resiliency.CircuitBreaker.call(MyBreaker, fn -> HttpClient.get(url) end)
 
   3. **Handle the result** — Every module returns `{:ok, value}` on success and
      `{:error, reason}` on failure, so pattern matching is uniform across the

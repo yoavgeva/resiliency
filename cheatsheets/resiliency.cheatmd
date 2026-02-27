@@ -375,6 +375,95 @@ Map.run(items, &process/1, max_concurrency: 5)
 # => {:error, reason}
 ```
 
+## CircuitBreaker
+{: .col-2}
+
+### Start
+
+```elixir
+# In supervision tree
+children = [
+  {Resiliency.CircuitBreaker,
+   name: MyApp.Breaker,
+   failure_rate_threshold: 0.5}
+]
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+### Basic Call
+
+```elixir
+alias Resiliency.CircuitBreaker
+
+case CircuitBreaker.call(MyApp.Breaker, fn ->
+  HttpClient.get(url)
+end) do
+  {:ok, response} -> handle(response)
+  {:error, :circuit_open} -> :degraded
+  {:error, reason} -> {:error, reason}
+end
+```
+
+### Custom Classification
+
+```elixir
+CircuitBreaker.start_link(
+  name: MyApp.Breaker,
+  should_record: fn
+    {:ok, %{status: 200}} -> :success
+    {:ok, %{status: 404}} -> :ignore
+    {:ok, %{status: 503}} -> :failure
+    {:error, _}           -> :failure
+    _                     -> :success
+  end
+)
+```
+
+### Two-Step API
+
+```elixir
+{:ok, record} = CircuitBreaker.allow(MyApp.Breaker)
+result = do_work()
+record.(:success)  # or :failure or :ignore
+# One-shot: only the first call records, duplicates are no-ops
+```
+
+### Get State & Stats
+
+```elixir
+CircuitBreaker.get_state(MyApp.Breaker)
+# => :closed | :open | :half_open
+
+CircuitBreaker.get_stats(MyApp.Breaker)
+# => %{state: :closed, total: 87, failures: 12,
+#       failure_rate: 0.1379, slow_calls: 3,
+#       slow_call_rate: 0.0345}
+```
+
+### Manual Control
+
+```elixir
+CircuitBreaker.force_open(MyApp.Breaker)
+# => :ok  (stays open until reset/force_close)
+
+CircuitBreaker.force_close(MyApp.Breaker)
+# => :ok  (resets window)
+
+CircuitBreaker.reset(MyApp.Breaker)
+# => :ok  (back to initial state)
+```
+
+### Callback
+
+```elixir
+CircuitBreaker.start_link(
+  name: MyApp.Breaker,
+  on_state_change: fn name, from, to ->
+    Logger.warning("#{name}: #{from} -> #{to}")
+  end
+)
+```
+
 ## WeightedSemaphore
 {: .col-2}
 

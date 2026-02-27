@@ -9,13 +9,85 @@ recommendations for common workloads.
 
 ## Table of Contents
 
-1. [BackoffRetry Tuning](#backoffretry-tuning)
-2. [Hedged Requests Tuning](#hedged-requests-tuning)
-3. [SingleFlight Tuning](#singleflight-tuning)
-4. [Task Combinator Tuning](#task-combinator-tuning)
-5. [WeightedSemaphore Tuning](#weightedsemaphore-tuning)
-6. [Observability](#observability)
-7. [Common Pitfalls](#common-pitfalls)
+1. [CircuitBreaker Tuning](#circuitbreaker-tuning)
+2. [BackoffRetry Tuning](#backoffretry-tuning)
+3. [Hedged Requests Tuning](#hedged-requests-tuning)
+4. [SingleFlight Tuning](#singleflight-tuning)
+5. [Task Combinator Tuning](#task-combinator-tuning)
+6. [WeightedSemaphore Tuning](#weightedsemaphore-tuning)
+7. [Observability](#observability)
+8. [Common Pitfalls](#common-pitfalls)
+
+---
+
+## CircuitBreaker Tuning
+
+### Parameter Reference
+
+| Parameter | Default | Range | Effect |
+|---|---|---|---|
+| `:name` | -- (required) | atom or `{:via, ...}` | Registered name for the GenServer. |
+| `:window_size` | `100` | `1..` | Number of call outcomes in the count-based sliding window. Larger windows smooth out short bursts but react slower to genuine shifts. |
+| `:failure_rate_threshold` | `0.5` | `0.0..1.0` | Failure rate that trips the circuit. `0.5` means the circuit trips when half or more of the recorded calls fail. |
+| `:slow_call_threshold` | `:infinity` | `:infinity` or `1..` ms | Duration above which a call is classified as "slow". `:infinity` disables slow call detection entirely. |
+| `:slow_call_rate_threshold` | `1.0` | `0.0..1.0` | Slow call rate that trips the circuit. `1.0` effectively disables slow-rate tripping. |
+| `:open_timeout` | `60_000` ms | `1..` | Time the circuit stays `:open` before transitioning to `:half_open` for probing. |
+| `:permitted_calls_in_half_open` | `1` | `1..` | Number of probe calls allowed through in `:half_open` state before deciding to close or reopen. |
+| `:minimum_calls` | `10` | `1..` | Minimum recorded calls in the window before the failure rate is evaluated. Prevents tripping on small sample sizes. |
+| `:should_record` | default predicate | `fn result -> :success \| :failure \| :ignore` | Custom classification function. `:ignore` results are not counted in the window. |
+| `:on_state_change` | `nil` | `fn name, from, to -> any` or `nil` | Callback fired on every state transition. Use for logging, metrics, or telemetry. |
+
+### How Parameters Interact
+
+The circuit evaluates after each recorded call:
+
+```
+if window.total >= minimum_calls do
+  if failure_rate >= failure_rate_threshold or slow_rate >= slow_call_rate_threshold do
+    trip to :open
+  end
+end
+```
+
+The `:minimum_calls` parameter acts as a warm-up guard -- the circuit will not
+trip until enough calls have been observed. This prevents a single failure from
+tripping a freshly started breaker.
+
+The sliding window is count-based (not time-based). Old outcomes are evicted
+when new ones push them out of the fixed-size buffer. This means the window
+naturally adapts to traffic volume without requiring time-based expiry.
+
+### Tuning for Common Workloads
+
+| Scenario | `failure_rate_threshold` | `minimum_calls` | `window_size` | `open_timeout` | Notes |
+|---|---|---|---|---|---|
+| High-throughput API | `0.5` | `20` | `200` | `30_000` | Larger window for stable signal. |
+| Critical payment service | `0.3` | `10` | `100` | `60_000` | Trip earlier to protect revenue. |
+| Background job queue | `0.8` | `50` | `500` | `120_000` | Tolerate more failures, longer recovery. |
+| Health-check probe | `0.5` | `3` | `10` | `10_000` | Small window, fast recovery for probes. |
+| Slow-call-sensitive API | `0.5` / `0.3` (slow) | `10` | `100` | `30_000` | Set `slow_call_threshold` to p99 latency. |
+
+### Interpreting get_stats
+
+Call `Resiliency.CircuitBreaker.get_stats/1` to inspect the breaker at runtime:
+
+```elixir
+%{
+  state: :closed,
+  total: 87,
+  failures: 12,
+  slow_calls: 3,
+  failure_rate: 0.1379,
+  slow_call_rate: 0.0345
+}
+```
+
+| Stat | Healthy range | What it means |
+|---|---|---|
+| `failure_rate` | < `failure_rate_threshold` | Current failure rate in the sliding window. |
+| `slow_call_rate` | < `slow_call_rate_threshold` | Current slow call rate. High values suggest downstream latency issues. |
+| `total` | >= `minimum_calls` | Total calls in the window. Below `minimum_calls`, the circuit will not trip. |
+| `state` | `:closed` | Current state. `:open` means rejecting calls; `:half_open` means probing. |
 
 ---
 
@@ -388,6 +460,41 @@ Utilization = avg_concurrent_weight / max
 
 ## Observability
 
+### Emitting Telemetry from CircuitBreaker
+
+Use the `:on_state_change` callback to emit `:telemetry` events on every
+state transition:
+
+```elixir
+{Resiliency.CircuitBreaker,
+ name: MyApp.Breaker,
+ failure_rate_threshold: 0.5,
+ on_state_change: fn name, from, to ->
+   :telemetry.execute(
+     [:my_app, :circuit_breaker, :state_change],
+     %{},
+     %{name: name, from: from, to: to}
+   )
+ end}
+```
+
+Poll `Resiliency.CircuitBreaker.get_stats/1` periodically for dashboard metrics:
+
+```elixir
+stats = Resiliency.CircuitBreaker.get_stats(MyApp.Breaker)
+
+:telemetry.execute(
+  [:my_app, :circuit_breaker, :stats],
+  %{
+    failure_rate: stats.failure_rate,
+    slow_call_rate: stats.slow_call_rate,
+    total: stats.total,
+    failures: stats.failures
+  },
+  %{name: MyApp.Breaker, state: stats.state}
+)
+```
+
 ### Logging Retry Attempts
 
 Use the `:on_retry` callback to emit structured log lines on every retry:
@@ -633,6 +740,8 @@ end
 
 | Module | Event | Measurements | Metadata |
 |---|---|---|---|
+| CircuitBreaker | `[:app, :circuit_breaker, :state_change]` | `%{}` | `%{name: atom, from: atom, to: atom}` |
+| CircuitBreaker | `[:app, :circuit_breaker, :stats]` | `%{failure_rate: float, total: integer, ...}` | `%{name: atom, state: atom}` |
 | BackoffRetry | `[:app, :retry, :attempt]` | `%{delay_ms: integer}` | `%{attempt: integer, error: string, service: atom}` |
 | BackoffRetry | `[:app, :retry, :success]` | `%{duration: native_time}` | `%{service: atom}` |
 | BackoffRetry | `[:app, :retry, :failure]` | `%{duration: native_time}` | `%{service: atom}` |
@@ -648,6 +757,13 @@ end
 
 | Mistake | Symptom | Fix |
 |---|---|---|
+| `minimum_calls` too low | Circuit trips on normal variance -- a few early failures trip the breaker. | Increase `minimum_calls` to at least 10. Higher for high-throughput services. |
+| `failure_rate_threshold` too low | Circuit trips too aggressively; service appears degraded when it is merely imperfect. | Start with `0.5` and lower only if the downstream is critical and failures are costly. |
+| `open_timeout` too short | Circuit keeps probing a still-broken service, consuming resources. | Set `open_timeout` to at least the downstream's expected recovery time. |
+| `open_timeout` too long | Service has recovered but callers are still being rejected. | Balance between recovery time and responsiveness. Use `force_close/1` for manual intervention. |
+| `window_size` too small | A few bad calls dominate the rate; circuit trips on transient spikes. | Use a window large enough to smooth out normal variance (e.g., 100+). |
+| `permitted_calls_in_half_open` too low | A single unlucky probe reopens the circuit; recovery takes multiple open-timeout cycles. | Increase to 3--5 for more confident half-open evaluation. |
+| Not handling `{:error, :circuit_open}` | Caller crashes or returns unexpected error shape. | Always pattern-match on `:circuit_open` and degrade gracefully. |
 | Retry delay too short | Floods downstream during outage; downstream never recovers. | Increase `base_delay`, use exponential backoff, add jitter via `Backoff.jitter/2`. |
 | No jitter on retries | Thundering herd -- all clients retry at the same instant. | Compose `Backoff.jitter(0.25)` into your backoff stream. |
 | Retrying non-idempotent calls | Duplicate side effects (double charges, duplicate messages). | Use `:retry_if` to only retry safe errors (timeouts, connection refused). Return `Resiliency.BackoffRetry.abort(reason)` for fatal errors. |
@@ -664,4 +780,4 @@ end
 | Weight exceeds max | `{:error, :weight_exceeds_max}` returned immediately. | Ensure no single operation's weight can exceed the semaphore's `:max`. Validate weights at the call site. |
 | `Race.run/1` without timeout | If all backends hang, the caller hangs forever. | Always pass a `:timeout` to `Race.run/1` in production. |
 | `Resiliency.Map.run/3` with `max_concurrency: 1` | Effectively sequential -- no parallelism benefit. | Use `max_concurrency` >= 2. If you need sequential execution, use `Enum.map/2` directly. |
-| Forgetting to supervise stateful modules | Tracker or SingleFlight crashes and is not restarted. | Always start `Resiliency.Hedged` and `Resiliency.SingleFlight` under a supervisor using their `child_spec/1`. |
+| Forgetting to supervise stateful modules | Tracker, SingleFlight, or CircuitBreaker crashes and is not restarted. | Always start `Resiliency.CircuitBreaker`, `Resiliency.Hedged`, and `Resiliency.SingleFlight` under a supervisor using their `child_spec/1`. |

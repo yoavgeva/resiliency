@@ -1,7 +1,7 @@
 defmodule Resiliency.MixProject do
   use Mix.Project
 
-  @version "0.2.0"
+  @version "0.3.0"
   @source_url "https://github.com/yoavgeva/resiliency"
 
   def project do
@@ -16,7 +16,7 @@ defmodule Resiliency.MixProject do
       dialyzer: [plt_add_apps: [:ex_unit]],
       name: "Resiliency",
       description:
-        "Resilience and concurrency toolkit for Elixir — retry, hedged requests, single-flight, task combinators, and weighted semaphore."
+        "Resilience and concurrency toolkit for Elixir — circuit breaker, retry, hedged requests, single-flight, task combinators, and weighted semaphore."
     ]
   end
 
@@ -80,7 +80,8 @@ defmodule Resiliency.MixProject do
           Resiliency.Map,
           Resiliency.FirstOk
         ],
-        Semaphore: [Resiliency.WeightedSemaphore]
+        Semaphore: [Resiliency.WeightedSemaphore],
+        "Circuit Breaker": [Resiliency.CircuitBreaker]
       ]
     ]
   end

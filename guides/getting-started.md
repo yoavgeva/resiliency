@@ -13,7 +13,7 @@ Add `resiliency` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:resiliency, "~> 0.2.0"}
+    {:resiliency, "~> 0.3.0"}
   ]
 end
 ```
@@ -562,6 +562,106 @@ large requests.
 
 ---
 
+## Your First Circuit Breaker
+
+`Resiliency.CircuitBreaker` monitors call outcomes and "trips" when the
+failure rate exceeds a threshold. While tripped, calls are rejected
+immediately — giving the downstream service time to recover. After a
+cool-down period, probe calls verify the service is healthy before
+resuming full traffic.
+
+### 1. Start the breaker
+
+```elixir
+{:ok, _pid} =
+  Resiliency.CircuitBreaker.start_link(
+    name: MyApp.Breaker,
+    failure_rate_threshold: 0.5,
+    minimum_calls: 10,
+    open_timeout: 30_000
+  )
+```
+
+### 2. Basic call
+
+```elixir
+case Resiliency.CircuitBreaker.call(MyApp.Breaker, fn ->
+  HttpClient.get("https://api.example.com/data")
+end) do
+  {:ok, response} -> handle_response(response)
+  {:error, :circuit_open} -> {:error, :service_degraded}
+  {:error, reason} -> {:error, reason}
+end
+```
+
+### 3. Custom failure classification
+
+By default, `{:ok, _}` is a success and `{:error, _}` is a failure. Override
+with `:should_record` to ignore expected errors or treat specific successes
+as failures:
+
+```elixir
+Resiliency.CircuitBreaker.start_link(
+  name: MyApp.Breaker,
+  should_record: fn
+    {:ok, %{status: 200}} -> :success
+    {:ok, %{status: 404}} -> :ignore   # not counted
+    {:ok, %{status: 503}} -> :failure
+    {:error, _}           -> :failure
+    _                     -> :success
+  end
+)
+```
+
+### 4. Two-step API
+
+When you cannot wrap the operation in a single function:
+
+```elixir
+case Resiliency.CircuitBreaker.allow(MyApp.Breaker) do
+  {:ok, record} ->
+    result = do_work()
+    record.(:success)   # or :failure or :ignore (one-shot, duplicates are no-ops)
+    {:ok, result}
+
+  {:error, :circuit_open} ->
+    {:error, :service_degraded}
+end
+```
+
+### 5. Manual control
+
+```elixir
+# Force the circuit open (stays open until reset/force_close)
+Resiliency.CircuitBreaker.force_open(MyApp.Breaker)
+
+# Force it back to closed
+Resiliency.CircuitBreaker.force_close(MyApp.Breaker)
+
+# Reset to initial state
+Resiliency.CircuitBreaker.reset(MyApp.Breaker)
+
+# Inspect current state and statistics
+Resiliency.CircuitBreaker.get_state(MyApp.Breaker)  # => :closed
+Resiliency.CircuitBreaker.get_stats(MyApp.Breaker)   # => %{state: :closed, ...}
+```
+
+### 6. Supervision tree integration
+
+```elixir
+children = [
+  {Resiliency.CircuitBreaker,
+   name: MyApp.Breaker,
+   failure_rate_threshold: 0.5,
+   open_timeout: 30_000},
+  # ... other children
+]
+
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+---
+
 ## Combining Patterns
 
 The real power of Resiliency comes from composing primitives. Here is a
@@ -615,6 +715,9 @@ hedging).
 
 Now that you have the fundamentals, explore further:
 
+- **[`Resiliency.CircuitBreaker`](Resiliency.CircuitBreaker.html)** --
+  sliding window, failure rate thresholds, slow call detection, half-open
+  probing, manual control, and callback-based observability.
 - **[`Resiliency.BackoffRetry`](Resiliency.BackoffRetry.html)** -- full
   option reference, custom backoff streams, the `Abort` struct, and
   `reraise: true` for preserving stacktraces.

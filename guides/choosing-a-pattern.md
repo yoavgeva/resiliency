@@ -10,6 +10,33 @@ Start from the problem you are trying to solve and follow the branch.
 
 ---
 
+### "My downstream service is failing and I want to stop calling it"
+
+Use **`Resiliency.CircuitBreaker`** -- monitor failure rates and trip the circuit
+when the downstream is unhealthy.  Probe calls automatically test recovery.
+
+```elixir
+children = [{Resiliency.CircuitBreaker, name: MyBreaker, failure_rate_threshold: 0.5}]
+Supervisor.start_link(children, strategy: :one_for_one)
+
+case Resiliency.CircuitBreaker.call(MyBreaker, fn ->
+  HttpClient.get!(url)
+end) do
+  {:ok, body} -> body
+  {:error, :circuit_open} -> {:error, :service_degraded}
+  {:error, reason} -> {:error, reason}
+end
+```
+
+Key traits:
+
+- Reduces load -- stops calling a failing service entirely.
+- Automatic recovery -- probes the service after a cool-down period.
+- Failure-rate-based (not just consecutive failures) with a sliding window.
+- Stateful -- requires a `GenServer`.
+
+---
+
 ### "My requests sometimes fail"
 
 Use **`Resiliency.BackoffRetry`** -- retry the operation with configurable
@@ -175,6 +202,7 @@ Key traits:
 
 | Pattern | Problem | Adds Latency? | Adds Load? | Stateful? | Best For |
 |---|---|---|---|---|---|
+| `CircuitBreaker` | Sustained downstream failures | No -- rejects immediately when open | No -- stops calling the downstream | Yes | Protecting against cascading failures, failing fast when a service is down |
 | `BackoffRetry` | Transient failures | Yes -- backoff delays between attempts | No -- sequential attempts | No | HTTP calls, database queries, anything with intermittent errors |
 | `Hedged` | Tail latency | No -- reduces p99 | Yes -- fires extra requests | Adaptive: yes; Stateless: no | Latency-sensitive RPCs, fan-out queries, cache lookups |
 | `SingleFlight` | Thundering herd / duplicate work | No -- late arrivals skip the I/O and share the result | No -- reduces load by deduplication | Yes | Cache population, config reloads, expensive computations with shared keys |
@@ -187,6 +215,17 @@ Key traits:
 ---
 
 ## "Why not just use..."
+
+### `fuse` / `ex_break`
+
+`fuse` is an Erlang library last released in 2021. It lacks a half-open state,
+sliding window failure rates, slow call detection, and its API is non-idiomatic
+for Elixir. `ex_break` provides basic circuit breaking but no sliding window or
+percentage-based thresholds. `Resiliency.CircuitBreaker` provides
+Resilience4j-quality features: count-based sliding window with O(1) failure-rate
+computation, configurable slow call thresholds, half-open probing, custom failure
+classification via `should_record`, and callback-based observability -- all with
+an API that matches the rest of this library.
 
 ### `Task.async` + `Task.await`
 
@@ -303,6 +342,21 @@ end)
 ---
 
 ## Parameter Quick-Reference
+
+### `Resiliency.CircuitBreaker`
+
+| Option | Type | Default | Recommendation |
+|---|---|---|---|
+| `:name` | atom or `{:via, ...}` | required | One breaker per downstream service |
+| `:window_size` | positive integer | `100` | Match to your traffic volume -- larger for high-throughput services |
+| `:failure_rate_threshold` | float 0.0–1.0 | `0.5` | 0.5 is a good default; lower for critical services |
+| `:slow_call_threshold` | ms or `:infinity` | `:infinity` | Set to your p99 latency to detect slow calls |
+| `:slow_call_rate_threshold` | float 0.0–1.0 | `1.0` | Effectively disabled at 1.0; lower to trip on slow calls |
+| `:open_timeout` | ms | `60_000` | Time before probing -- longer for services with slow recovery |
+| `:permitted_calls_in_half_open` | positive integer | `1` | More probes give higher confidence but delay recovery |
+| `:minimum_calls` | positive integer | `10` | Prevents tripping on small sample sizes |
+| `:should_record` | `fn result -> :success \| :failure \| :ignore` | default | Classify results; `:ignore` is not counted |
+| `:on_state_change` | `fn name, from, to -> any` or `nil` | `nil` | Use for logging or telemetry |
 
 ### `Resiliency.BackoffRetry.retry/2`
 

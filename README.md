@@ -8,6 +8,7 @@ A collection of resilience and concurrency primitives for Elixir.
 
 | Module | Description |
 |---|---|
+| `Resiliency.CircuitBreaker` | Circuit breaker — stop calling a failing service, auto-recover with half-open probing |
 | `Resiliency.BackoffRetry` | Retry with configurable backoff strategies (constant, exponential, linear, jitter) |
 | `Resiliency.Hedged` | Hedged requests — send a backup after a percentile-based delay to cut tail latency |
 | `Resiliency.SingleFlight` | Deduplicate concurrent calls to the same key so the function executes only once |
@@ -86,6 +87,21 @@ results = Resiliency.AllSettled.run([fn -> risky_op() end, ...])
   fn -> try_db() end,
   fn -> try_api() end
 ])
+```
+
+### CircuitBreaker
+
+```elixir
+# Start under a supervisor
+children = [{Resiliency.CircuitBreaker, name: :my_breaker, failure_rate_threshold: 0.5}]
+Supervisor.start_link(children, strategy: :one_for_one)
+
+# Wrapped execution
+case Resiliency.CircuitBreaker.call(:my_breaker, fn -> HttpClient.get(url) end) do
+  {:ok, response} -> handle_response(response)
+  {:error, :circuit_open} -> {:error, :service_degraded}
+  {:error, reason} -> {:error, reason}
+end
 ```
 
 ### WeightedSemaphore

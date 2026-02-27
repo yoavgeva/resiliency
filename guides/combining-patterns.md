@@ -390,6 +390,7 @@ together.
 
 The composition order, from outermost to innermost:
 
+0. **CircuitBreaker** -- Reject calls when the downstream is known to be down.
 1. **SingleFlight** -- Deduplicate concurrent callers for the same product.
 2. **WeightedSemaphore** -- Bound total concurrent outbound requests.
 3. **BackoffRetry** -- Retry transient failures with exponential backoff.
@@ -409,6 +410,7 @@ defmodule MyApp.Inventory do
 
   require Logger
 
+  @breaker MyApp.Inventory.Breaker
   @flight MyApp.Inventory.Flight
   @semaphore MyApp.Inventory.Semaphore
   @tracker MyApp.Inventory.Tracker
@@ -430,51 +432,59 @@ defmodule MyApp.Inventory do
   end
 
   defp fetch_inventory(sku) do
-    # Layer 1: SingleFlight -- deduplicate concurrent callers
-    Resiliency.SingleFlight.flight(@flight, "inventory:#{sku}", fn ->
-      # Layer 2: WeightedSemaphore -- bound concurrency
-      case Resiliency.WeightedSemaphore.acquire(@semaphore, 2, fn ->
-             # Layer 3: BackoffRetry -- retry transient errors
-             Resiliency.BackoffRetry.retry(
-               fn ->
-                 # Layer 4: Hedged -- cut tail latency
-                 case Resiliency.Hedged.run(@tracker, fn ->
-                        fetch_from_api(sku)
-                      end, timeout: 4_000) do
-                   {:ok, data} -> {:ok, data}
-                   {:error, reason} -> {:error, reason}
-                 end
-               end,
-               max_attempts: 3,
-               backoff: :exponential,
-               base_delay: 100,
-               max_delay: 2_000,
-               budget: 8_000,
-               retry_if: fn
-                 {:error, :timeout} -> true
-                 {:error, :service_unavailable} -> true
-                 {:error, :rate_limited} -> true
-                 {:error, _} -> false
-               end,
-               on_retry: fn attempt, delay, error ->
-                 Logger.warning(
-                   "Inventory.fetch retry sku=#{sku} " <>
-                     "attempt=#{attempt} delay=#{delay}ms error=#{inspect(error)}"
-                 )
-               end
-             )
-           end) do
-        {:ok, {:ok, data}} ->
-          Cache.put("inventory:#{sku}", data, ttl: :timer.seconds(30))
-          data
+    # Layer 0: CircuitBreaker -- reject when downstream is known-down
+    case Resiliency.CircuitBreaker.call(@breaker, fn ->
+           # Layer 1: SingleFlight -- deduplicate concurrent callers
+           Resiliency.SingleFlight.flight(@flight, "inventory:#{sku}", fn ->
+             # Layer 2: WeightedSemaphore -- bound concurrency
+             case Resiliency.WeightedSemaphore.acquire(@semaphore, 2, fn ->
+                    # Layer 3: BackoffRetry -- retry transient errors
+                    Resiliency.BackoffRetry.retry(
+                      fn ->
+                        # Layer 4: Hedged -- cut tail latency
+                        case Resiliency.Hedged.run(@tracker, fn ->
+                               fetch_from_api(sku)
+                             end, timeout: 4_000) do
+                          {:ok, data} -> {:ok, data}
+                          {:error, reason} -> {:error, reason}
+                        end
+                      end,
+                      max_attempts: 3,
+                      backoff: :exponential,
+                      base_delay: 100,
+                      max_delay: 2_000,
+                      budget: 8_000,
+                      retry_if: fn
+                        {:error, :timeout} -> true
+                        {:error, :service_unavailable} -> true
+                        {:error, :rate_limited} -> true
+                        {:error, _} -> false
+                      end,
+                      on_retry: fn attempt, delay, error ->
+                        Logger.warning(
+                          "Inventory.fetch retry sku=#{sku} " <>
+                            "attempt=#{attempt} delay=#{delay}ms error=#{inspect(error)}"
+                        )
+                      end
+                    )
+                  end) do
+               {:ok, {:ok, data}} ->
+                 Cache.put("inventory:#{sku}", data, ttl: :timer.seconds(30))
+                 {:ok, data}
 
-        {:ok, {:error, reason}} ->
-          raise "Inventory API error for #{sku}: #{inspect(reason)}"
+               {:ok, {:error, reason}} ->
+                 {:error, reason}
 
-        {:error, reason} ->
-          raise "Semaphore error for #{sku}: #{inspect(reason)}"
-      end
-    end)
+               {:error, reason} ->
+                 {:error, reason}
+             end
+           end)
+         end) do
+      {:ok, {:ok, data}} -> {:ok, data}
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:error, :circuit_open} -> {:error, :service_degraded}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp fetch_from_api(sku) do
@@ -501,6 +511,11 @@ defmodule MyApp.Application do
   def start(_type, _args) do
     children = [
       # -- Inventory resilience stack --
+      {Resiliency.CircuitBreaker,
+       name: MyApp.Inventory.Breaker,
+       failure_rate_threshold: 0.5,
+       open_timeout: 30_000},
+
       {Resiliency.SingleFlight, name: MyApp.Inventory.Flight},
 
       {Resiliency.WeightedSemaphore,
@@ -526,6 +541,9 @@ end
 Here is what happens when 50 concurrent requests arrive for the same SKU,
 all missing the cache:
 
+0. **CircuitBreaker** -- The breaker checks its state. If `:open`, all 50
+   callers immediately receive `{:error, :service_degraded}` with zero
+   downstream load. If `:closed` or `:half_open`, the call proceeds.
 1. **SingleFlight** -- All 50 callers call `flight/3` with key
    `"inventory:sku-123"`. Only the first caller executes the function. The
    other 49 block, waiting for the result.
@@ -538,21 +556,22 @@ all missing the cache:
    first wins.
 5. If the hedged call returns `{:error, :service_unavailable}`, BackoffRetry
    checks `retry_if`, sleeps with exponential backoff, and loops to step 4.
-6. On success, the result propagates back up: the semaphore releases its
-   permits, SingleFlight broadcasts the result to all 49 waiting callers,
-   and the cache is populated.
+6. On success, the result propagates back up: the circuit breaker records a
+   success, the semaphore releases its permits, SingleFlight broadcasts the
+   result to all 49 waiting callers, and the cache is populated.
 
 Total downstream impact from 50 concurrent callers: at most 3 attempts x 2
-hedged requests = 6 HTTP requests, all bounded by the semaphore.
+hedged requests = 6 HTTP requests, all bounded by the semaphore. If the
+circuit is open, downstream impact is zero.
 
 ---
 
 ## Supervision Tree Design
 
-When combining multiple patterns, all stateful components -- `Hedged.Tracker`,
-`SingleFlight`, and `WeightedSemaphore` -- need to be started under a
-supervisor. `BackoffRetry`, `Race`, `AllSettled`, `Map`, and `FirstOk` are stateless and require no
-supervision.
+When combining multiple patterns, all stateful components -- `CircuitBreaker`,
+`Hedged.Tracker`, `SingleFlight`, and `WeightedSemaphore` -- need to be started
+under a supervisor. `BackoffRetry`, `Race`, `AllSettled`, `Map`, and `FirstOk`
+are stateless and require no supervision.
 
 ### Grouping by domain
 
@@ -581,6 +600,11 @@ defmodule MyApp.Application do
   defp resilience_children do
     [
       # -- Payment gateway stack --
+      {Resiliency.CircuitBreaker,
+       name: MyApp.PaymentGateway.Breaker,
+       failure_rate_threshold: 0.5,
+       open_timeout: 60_000},
+
       {Resiliency.Hedged,
        name: MyApp.PaymentGateway.Tracker,
        percentile: 99,
@@ -605,6 +629,11 @@ defmodule MyApp.Application do
        name: MyApp.UserProfile.Flight},
 
       # -- Inventory stack --
+      {Resiliency.CircuitBreaker,
+       name: MyApp.Inventory.Breaker,
+       failure_rate_threshold: 0.5,
+       open_timeout: 30_000},
+
       {Resiliency.SingleFlight,
        name: MyApp.Inventory.Flight},
 
@@ -629,6 +658,9 @@ Each stateful module provides a `child_spec/1` that works with standard
 `Supervisor` syntax:
 
 ```elixir
+# CircuitBreaker -- failure-rate circuit breaker
+{Resiliency.CircuitBreaker, name: MyApp.Breaker, failure_rate_threshold: 0.5}
+
 # Hedged.Tracker -- adaptive delay + token-bucket throttling
 {Resiliency.Hedged, name: MyApp.HedgeTracker, percentile: 95}
 
@@ -713,26 +745,22 @@ stats = Resiliency.Hedged.Tracker.stats(MyApp.Search.Tracker)
 
 ### Circuit breakers
 
-Resiliency does not include a circuit breaker. If you need one -- for example,
-to stop calling a downstream service that has been failing for minutes -- layer
-it as the outermost wrapper, before SingleFlight:
+`Resiliency.CircuitBreaker` sits as the outermost wrapper, before
+SingleFlight, making a binary decision -- call or reject -- before any
+other work happens. This prevents retries and hedges from running against
+a service that is known to be down:
 
 ```elixir
-# Pseudocode -- use a circuit breaker library of your choice
-case CircuitBreaker.call(:payment_api, fn ->
+case Resiliency.CircuitBreaker.call(MyApp.PaymentBreaker, fn ->
        Resiliency.SingleFlight.flight(@flight, key, fn ->
          # ... semaphore + retry + hedge ...
        end)
      end) do
   {:ok, result} -> result
   {:error, :circuit_open} -> {:error, :service_degraded}
+  {:error, reason} -> {:error, reason}
 end
 ```
-
-The circuit breaker sits outside the entire stack because it makes a
-binary decision -- call or reject -- before any other work happens. This
-prevents retries and hedges from running against a service that is known
-to be down.
 
 ### Graceful degradation
 
