@@ -190,19 +190,23 @@ defmodule Resiliency.WeightedSemaphoreTest do
 
       wait_until(fn -> current(sem) == 1 end)
 
-      # Queue several waiters
+      # Queue waiters one at a time, waiting for each to enter the queue
+      # before spawning the next — ensures deterministic FIFO order.
       tasks =
         for i <- 1..5 do
-          Task.async(fn ->
-            Resiliency.WeightedSemaphore.acquire(sem, 1, fn ->
-              Agent.update(order_agent, &[i | &1])
-              i
-            end)
-          end)
-        end
+          expected_queued = i
 
-      # Let them all queue up
-      Process.sleep(50)
+          task =
+            Task.async(fn ->
+              Resiliency.WeightedSemaphore.acquire(sem, 1, fn ->
+                Agent.update(order_agent, &[i | &1])
+                i
+              end)
+            end)
+
+          wait_until(fn -> waiter_count(sem) == expected_queued end)
+          task
+        end
 
       gate_open(gate)
       assert {:ok, :held} = Task.await(holder)
@@ -491,6 +495,10 @@ defmodule Resiliency.WeightedSemaphoreTest do
 
   defp current(sem) do
     :sys.get_state(sem).current
+  end
+
+  defp waiter_count(sem) do
+    :queue.len(:sys.get_state(sem).waiters)
   end
 
   defp gate_new do
