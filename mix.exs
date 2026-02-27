@@ -74,7 +74,12 @@ defmodule Resiliency.MixProject do
           Resiliency.Hedged.Percentile
         ],
         "Single Flight": [Resiliency.SingleFlight],
-        "Task Combinators": [Resiliency.TaskExtension],
+        "Task Combinators": [
+          Resiliency.Race,
+          Resiliency.AllSettled,
+          Resiliency.Map,
+          Resiliency.FirstOk
+        ],
         Semaphore: [Resiliency.WeightedSemaphore]
       ]
     ]

@@ -11,7 +11,10 @@ A collection of resilience and concurrency primitives for Elixir.
 | `Resiliency.BackoffRetry` | Retry with configurable backoff strategies (constant, exponential, linear, jitter) |
 | `Resiliency.Hedged` | Hedged requests — send a backup after a percentile-based delay to cut tail latency |
 | `Resiliency.SingleFlight` | Deduplicate concurrent calls to the same key so the function executes only once |
-| `Resiliency.TaskExtension` | Task combinators: `race`, `all_settled`, `map`, `first_ok` |
+| `Resiliency.Race` | Race concurrent functions — first success wins, losers are cancelled |
+| `Resiliency.AllSettled` | Run all concurrently, collect every result regardless of failures |
+| `Resiliency.Map` | Bounded-concurrency parallel map with fail-fast cancellation |
+| `Resiliency.FirstOk` | Sequential fallback chain — try each function until one succeeds |
 | `Resiliency.WeightedSemaphore` | Weighted semaphore with FIFO fairness and timeout support |
 
 ## Installation
@@ -62,23 +65,23 @@ end, max_attempts: 3, backoff: :exponential)
 end)
 ```
 
-### TaskExtension
+### Task Combinators
 
 ```elixir
 # Race — first success wins, losers are killed
-{:ok, fastest} = Resiliency.TaskExtension.race([
+{:ok, fastest} = Resiliency.Race.run([
   fn -> fetch_from_cache() end,
   fn -> fetch_from_db() end
 ])
 
 # Parallel map with bounded concurrency
-{:ok, results} = Resiliency.TaskExtension.map(urls, &fetch/1, max_concurrency: 10)
+{:ok, results} = Resiliency.Map.run(urls, &fetch/1, max_concurrency: 10)
 
 # all_settled — never short-circuits, collects all results
-results = Resiliency.TaskExtension.all_settled([fn -> risky_op() end, ...])
+results = Resiliency.AllSettled.run([fn -> risky_op() end, ...])
 
 # first_ok — sequential fallback chain
-{:ok, value} = Resiliency.TaskExtension.first_ok([
+{:ok, value} = Resiliency.FirstOk.run([
   fn -> try_cache() end,
   fn -> try_db() end,
   fn -> try_api() end
@@ -109,7 +112,7 @@ If you were using any of the standalone packages (`backoff_retry`, `hedged`, `si
 | `BackoffRetry.retry(...)` | `Resiliency.BackoffRetry.retry(...)` |
 | `Hedged.run(...)` | `Resiliency.Hedged.run(...)` |
 | `SingleFlight.flight(...)` | `Resiliency.SingleFlight.flight(...)` |
-| `TaskExtension.race(...)` | `Resiliency.TaskExtension.race(...)` |
+| `TaskExtension.race(...)` | `Resiliency.Race.run(...)` |
 | `WeightedSemaphore.acquire(...)` | `Resiliency.WeightedSemaphore.acquire(...)` |
 
 ## License

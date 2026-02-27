@@ -348,17 +348,18 @@ Supervisor.start_link(children, strategy: :one_for_one)
 
 ## Racing Tasks
 
-`Resiliency.TaskExtension` provides higher-level concurrency combinators
+`Resiliency.Race`, `Resiliency.AllSettled`, `Resiliency.Map`, and
+`Resiliency.FirstOk` provide higher-level concurrency combinators
 that are stateless -- no GenServer, no supervision tree entry.
 
-### `race/1` -- first success wins
+### `Race.run/1` -- first success wins
 
 Fire multiple strategies in parallel and take whichever returns first.
 Losers are killed automatically:
 
 ```elixir
 {:ok, data} =
-  Resiliency.TaskExtension.race([
+  Resiliency.Race.run([
     fn ->
       # Try the local cache
       Process.sleep(5)
@@ -378,20 +379,20 @@ If a task crashes, the race continues with the remaining tasks:
 
 ```elixir
 {:ok, :backup} =
-  Resiliency.TaskExtension.race([
+  Resiliency.Race.run([
     fn -> raise "primary is down" end,
     fn -> :backup end
   ])
 ```
 
-### `all_settled/1` -- collect everything
+### `AllSettled.run/1` -- collect everything
 
 Run tasks in parallel and wait for all of them. Crashes do not propagate
 to the caller -- each slot gets `{:ok, value}` or `{:error, reason}`:
 
 ```elixir
 results =
-  Resiliency.TaskExtension.all_settled([
+  Resiliency.AllSettled.run([
     fn -> {:ok, "service_a response"} end,
     fn -> raise "service_b is broken" end,
     fn -> {:ok, "service_c response"} end
@@ -402,7 +403,7 @@ results =
 #     {:ok, {:ok, "service_c response"}}]
 ```
 
-### `map/3` -- bounded-concurrency parallel map
+### `Resiliency.Map.run/3` -- bounded-concurrency parallel map
 
 Process a list of items in parallel with a concurrency cap. On the first
 failure, all remaining work is cancelled:
@@ -417,7 +418,7 @@ urls = [
 ]
 
 {:ok, responses} =
-  Resiliency.TaskExtension.map(
+  Resiliency.Map.run(
     urls,
     fn url ->
       # Simulate fetching each URL
@@ -430,14 +431,14 @@ urls = [
 # responses is in the same order as urls
 ```
 
-### `first_ok/1` -- sequential fallback chain
+### `FirstOk.run/1` -- sequential fallback chain
 
 Try data sources one at a time. Stop at the first success. Later sources
 are never called if an earlier one succeeds:
 
 ```elixir
 {:ok, value} =
-  Resiliency.TaskExtension.first_ok([
+  Resiliency.FirstOk.run([
     fn ->
       # L1 cache miss
       {:error, :not_found}
@@ -624,7 +625,9 @@ Now that you have the fundamentals, explore further:
   token bucket tuning, `non_fatal` predicates for immediate re-hedging.
 - **[`Resiliency.SingleFlight`](Resiliency.SingleFlight.html)** --
   `forget/2` semantics, timeout behavior, error propagation.
-- **[`Resiliency.TaskExtension`](Resiliency.TaskExtension.html)** --
-  timeout options for `race`, `all_settled`, `map`, and `first_ok`.
+- **[`Resiliency.Race`](Resiliency.Race.html)** -- concurrent race, first success wins.
+- **[`Resiliency.AllSettled`](Resiliency.AllSettled.html)** -- concurrent execution, collect all results.
+- **[`Resiliency.Map`](Resiliency.Map.html)** -- bounded-concurrency parallel map with fail-fast.
+- **[`Resiliency.FirstOk`](Resiliency.FirstOk.html)** -- sequential fallback chain.
 - **[`Resiliency.WeightedSemaphore`](Resiliency.WeightedSemaphore.html)** --
   FIFO fairness guarantees, error handling, `try_acquire` vs `acquire`.

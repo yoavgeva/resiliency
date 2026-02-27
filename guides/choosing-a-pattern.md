@@ -125,13 +125,13 @@ Key traits:
 
 ### "I need to run tasks in parallel with richer semantics than Task"
 
-Use **`Resiliency.TaskExtension`** -- stateless combinators for common
-concurrency patterns.
+Use the stateless task combinators -- `Resiliency.Race`, `Resiliency.AllSettled`,
+`Resiliency.Map`, and `Resiliency.FirstOk`.
 
 **Race** -- first success wins, losers are killed:
 
 ```elixir
-{:ok, fastest} = Resiliency.TaskExtension.race([
+{:ok, fastest} = Resiliency.Race.run([
   fn -> fetch_from_region(:us_east) end,
   fn -> fetch_from_region(:eu_west) end
 ])
@@ -140,13 +140,13 @@ concurrency patterns.
 **Parallel map** -- bounded concurrency, cancels on first error:
 
 ```elixir
-{:ok, pages} = Resiliency.TaskExtension.map(urls, &fetch/1, max_concurrency: 10)
+{:ok, pages} = Resiliency.Map.run(urls, &fetch/1, max_concurrency: 10)
 ```
 
 **All settled** -- never short-circuits, collects every result:
 
 ```elixir
-results = Resiliency.TaskExtension.all_settled([
+results = Resiliency.AllSettled.run([
   fn -> risky_a() end,
   fn -> risky_b() end
 ])
@@ -156,7 +156,7 @@ results = Resiliency.TaskExtension.all_settled([
 **First ok** -- sequential fallback chain:
 
 ```elixir
-{:ok, value} = Resiliency.TaskExtension.first_ok([
+{:ok, value} = Resiliency.FirstOk.run([
   fn -> check_l1_cache(key) end,
   fn -> check_l2_cache(key) end,
   fn -> query_database(key) end
@@ -179,10 +179,10 @@ Key traits:
 | `Hedged` | Tail latency | No -- reduces p99 | Yes -- fires extra requests | Adaptive: yes; Stateless: no | Latency-sensitive RPCs, fan-out queries, cache lookups |
 | `SingleFlight` | Thundering herd / duplicate work | No -- late arrivals skip the I/O and share the result | No -- reduces load by deduplication | Yes | Cache population, config reloads, expensive computations with shared keys |
 | `WeightedSemaphore` | Unbounded concurrency | When saturated -- callers queue | No -- caps it | Yes | Database pools, API rate limits, disk I/O, GPU access |
-| `TaskExtension.race` | Need the fastest result from N sources | No -- returns the first success | Yes -- runs all concurrently | No | Multi-region fetch, redundant providers |
-| `TaskExtension.map` | Parallel processing with a concurrency cap | No (unless saturated) | Bounded by `max_concurrency` | No | Bulk HTTP fetches, batch processing |
-| `TaskExtension.all_settled` | Run all, tolerate individual failures | No | Yes -- runs all concurrently | No | Health checks, non-critical side effects, audit logging |
-| `TaskExtension.first_ok` | Sequential fallback chain | Yes -- tries one at a time | No -- sequential | No | Cache/DB/API tiered lookups |
+| `Race` | Need the fastest result from N sources | No -- returns the first success | Yes -- runs all concurrently | No | Multi-region fetch, redundant providers |
+| `Map` | Parallel processing with a concurrency cap | No (unless saturated) | Bounded by `max_concurrency` | No | Bulk HTTP fetches, batch processing |
+| `AllSettled` | Run all, tolerate individual failures | No | Yes -- runs all concurrently | No | Health checks, non-critical side effects, audit logging |
+| `FirstOk` | Sequential fallback chain | Yes -- tries one at a time | No -- sequential | No | Cache/DB/API tiered lookups |
 
 ---
 
@@ -191,9 +191,9 @@ Key traits:
 ### `Task.async` + `Task.await`
 
 `Task.await` crashes the caller on timeout or task failure.
-`Resiliency.TaskExtension.race` and `all_settled` handle failures gracefully --
+`Resiliency.Race.run` and `Resiliency.AllSettled.run` handle failures gracefully --
 crashed tasks are skipped or returned as `{:error, reason}`, and the caller
-never crashes.  `TaskExtension.map` also cancels remaining work on first error,
+never crashes.  `Resiliency.Map.run` also cancels remaining work on first error,
 which `Task.async_stream` does not do.
 
 ### `GenServer.call` with a timeout
@@ -218,10 +218,10 @@ hand-rolled loop typically drops.
 
 `Task.async_stream` returns a lazy stream, requires you to handle `:exit`
 tuples yourself, and does not cancel remaining work on failure.
-`Resiliency.TaskExtension.map/3` returns `{:ok, results}` or
+`Resiliency.Map.run/3` returns `{:ok, results}` or
 `{:error, reason}`, cancels all in-flight tasks on the first failure, and
 preserves input order.  If you need all results regardless of failure, use
-`all_settled` instead.
+`Resiliency.AllSettled.run/1` instead.
 
 ### Spawning two tasks manually for hedging
 
@@ -367,11 +367,11 @@ fresh execution -- useful after a known data change.
 `try_acquire/2,3` returns `:rejected` immediately if permits are unavailable --
 use it for best-effort work that can be dropped.
 
-### `Resiliency.TaskExtension`
+### Task Combinators
 
-| Function | Key Options | Defaults | Notes |
+| Module | Key Options | Defaults | Notes |
 |---|---|---|---|
-| `race/2` | `timeout` | `:infinity` | First success wins; all failures yield `{:error, :all_failed}` |
-| `all_settled/2` | `timeout` | `:infinity` | Timed-out tasks get `{:error, :timeout}` in the result list |
-| `map/3` | `max_concurrency`, `timeout` | `System.schedulers_online()`, `:infinity` | Cancels everything on first failure |
-| `first_ok/2` | `timeout` | `:infinity` | Sequential -- total timeout spans all attempts |
+| `Resiliency.Race.run/2` | `timeout` | `:infinity` | First success wins; all failures yield `{:error, :all_failed}` |
+| `Resiliency.AllSettled.run/2` | `timeout` | `:infinity` | Timed-out tasks get `{:error, :timeout}` in the result list |
+| `Resiliency.Map.run/3` | `max_concurrency`, `timeout` | `System.schedulers_online()`, `:infinity` | Cancels everything on first failure |
+| `Resiliency.FirstOk.run/2` | `timeout` | `:infinity` | Sequential -- total timeout spans all attempts |

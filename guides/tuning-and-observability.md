@@ -12,7 +12,7 @@ recommendations for common workloads.
 1. [BackoffRetry Tuning](#backoffretry-tuning)
 2. [Hedged Requests Tuning](#hedged-requests-tuning)
 3. [SingleFlight Tuning](#singleflight-tuning)
-4. [TaskExtension Tuning](#taskextension-tuning)
+4. [Task Combinator Tuning](#task-combinator-tuning)
 5. [WeightedSemaphore Tuning](#weightedsemaphore-tuning)
 6. [Observability](#observability)
 7. [Common Pitfalls](#common-pitfalls)
@@ -264,53 +264,53 @@ determined entirely by key design and usage patterns.
 
 ---
 
-## TaskExtension Tuning
+## Task Combinator Tuning
 
 ### Choosing the Right Combinator
 
-| Combinator | Use when | Concurrency | Failure behavior |
+| Module | Use when | Concurrency | Failure behavior |
 |---|---|---|---|
-| `race/1,2` | You need the fastest result from N alternatives | All functions run concurrently | First success wins; crashed tasks are skipped; returns `{:error, :all_failed}` if all fail |
-| `all_settled/1,2` | You need every result regardless of failures | All functions run concurrently | Each result is `{:ok, _}` or `{:error, _}` independently |
-| `map/2,3` | You are processing a collection with bounded parallelism | Up to `max_concurrency` at a time | Cancels all remaining work on first failure |
-| `first_ok/1,2` | You have a fallback chain (cache -> DB -> API) | Sequential -- one at a time | Tries the next function only after the previous one fails |
+| `Resiliency.Race` | You need the fastest result from N alternatives | All functions run concurrently | First success wins; crashed tasks are skipped; returns `{:error, :all_failed}` if all fail |
+| `Resiliency.AllSettled` | You need every result regardless of failures | All functions run concurrently | Each result is `{:ok, _}` or `{:error, _}` independently |
+| `Resiliency.Map` | You are processing a collection with bounded parallelism | Up to `max_concurrency` at a time | Cancels all remaining work on first failure |
+| `Resiliency.FirstOk` | You have a fallback chain (cache -> DB -> API) | Sequential -- one at a time | Tries the next function only after the previous one fails |
 
 ### Timeout Selection
 
 | Parameter | Default | Range | Effect |
 |---|---|---|---|
-| `:timeout` (race) | `:infinity` | `:infinity` or `1..` ms | Overall deadline for the race. Remaining tasks are killed when it expires. |
-| `:timeout` (all_settled) | `:infinity` | `:infinity` or `1..` ms | Completed tasks keep their results; tasks still running get `{:error, :timeout}`. |
-| `:timeout` (map) | `:infinity` | `:infinity` or `1..` ms | Returns `{:error, :timeout}` and kills all active tasks. |
-| `:timeout` (first_ok) | `:infinity` | `:infinity` or `1..` ms | Total budget across all sequential attempts. |
-| `:max_concurrency` (map) | `System.schedulers_online()` | `1..` | Limits how many items are processed in parallel. |
+| `:timeout` (Race) | `:infinity` | `:infinity` or `1..` ms | Overall deadline for the race. Remaining tasks are killed when it expires. |
+| `:timeout` (AllSettled) | `:infinity` | `:infinity` or `1..` ms | Completed tasks keep their results; tasks still running get `{:error, :timeout}`. |
+| `:timeout` (Map) | `:infinity` | `:infinity` or `1..` ms | Returns `{:error, :timeout}` and kills all active tasks. |
+| `:timeout` (FirstOk) | `:infinity` | `:infinity` or `1..` ms | Total budget across all sequential attempts. |
+| `:max_concurrency` (Map) | `System.schedulers_online()` | `1..` | Limits how many items are processed in parallel. |
 
 ### Timeout Rules of Thumb
 
-- For `race/1` -- set the timeout to your **SLA ceiling**. If no backend
+- For `Race.run/1` -- set the timeout to your **SLA ceiling**. If no backend
   responds in time, you want a clear timeout rather than an indefinite hang.
 
-- For `all_settled/1` -- set the timeout to the **slowest acceptable task
+- For `AllSettled.run/1` -- set the timeout to the **slowest acceptable task
   duration**. Tasks that finish within the deadline keep their results; the
   rest are marked as timed out.
 
-- For `map/2` -- multiply your **per-item budget** by the number of items
+- For `Resiliency.Map.run/2` -- multiply your **per-item budget** by the number of items
   divided by `max_concurrency`, then add a margin. Or use `:infinity` and rely
   on per-item timeouts inside the function.
 
-- For `first_ok/1` -- set the timeout to the **total latency budget** for the
+- For `FirstOk.run/1` -- set the timeout to the **total latency budget** for the
   entire fallback chain. Each attempt subtracts from the remaining budget.
 
-### `race` vs `first_ok` Decision
+### `Race` vs `FirstOk` Decision
 
 ```
 Do you want concurrent execution?
-  Yes -> race/1 (all functions run at once, first success wins)
-  No  -> first_ok/1 (sequential, stops at first success)
+  Yes -> Race.run/1 (all functions run at once, first success wins)
+  No  -> FirstOk.run/1 (sequential, stops at first success)
 ```
 
-Use `race/1` when all backends can handle the load of concurrent requests. Use
-`first_ok/1` when you want to avoid unnecessary calls to slower/more expensive
+Use `Race.run/1` when all backends can handle the load of concurrent requests. Use
+`FirstOk.run/1` when you want to avoid unnecessary calls to slower/more expensive
 backends.
 
 ---
@@ -662,6 +662,6 @@ end
 | Semaphore `max` too low | Healthy throughput is artificially limited; callers queue unnecessarily. | Profile the downstream and raise `max` to its tested concurrency limit. |
 | `try_acquire` without fallback | `:rejected` silently drops work. | Always handle the `:rejected` case -- return an error, queue the work, or degrade gracefully. |
 | Weight exceeds max | `{:error, :weight_exceeds_max}` returned immediately. | Ensure no single operation's weight can exceed the semaphore's `:max`. Validate weights at the call site. |
-| `race/1` without timeout | If all backends hang, the caller hangs forever. | Always pass a `:timeout` to `race/1` in production. |
-| `map/3` with `max_concurrency: 1` | Effectively sequential -- no parallelism benefit. | Use `max_concurrency` >= 2. If you need sequential execution, use `Enum.map/2` directly. |
+| `Race.run/1` without timeout | If all backends hang, the caller hangs forever. | Always pass a `:timeout` to `Race.run/1` in production. |
+| `Resiliency.Map.run/3` with `max_concurrency: 1` | Effectively sequential -- no parallelism benefit. | Use `max_concurrency` >= 2. If you need sequential execution, use `Enum.map/2` directly. |
 | Forgetting to supervise stateful modules | Tracker or SingleFlight crashes and is not restarted. | Always start `Resiliency.Hedged` and `Resiliency.SingleFlight` under a supervisor using their `child_spec/1`. |

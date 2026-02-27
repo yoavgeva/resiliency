@@ -275,15 +275,15 @@ end, 1_000)
 # new callers trigger a fresh execution
 ```
 
-## TaskExtension
+## Race
 {: .col-2}
 
-### Race
+### Basic Race
 
 ```elixir
-alias Resiliency.TaskExtension
+alias Resiliency.Race
 
-TaskExtension.race([
+Race.run([
   fn -> Process.sleep(100); :slow end,
   fn -> :fast end
 ])
@@ -293,16 +293,21 @@ TaskExtension.race([
 ### Race with Timeout
 
 ```elixir
-TaskExtension.race([
+Race.run([
   fn -> Process.sleep(10_000); :too_slow end
 ], timeout: 1_000)
 # => {:error, :timeout}
 ```
 
-### First OK
+## FirstOk
+{: .col-2}
+
+### Sequential Fallback
 
 ```elixir
-TaskExtension.first_ok([
+alias Resiliency.FirstOk
+
+FirstOk.run([
   fn -> {:error, :cache_miss} end,
   fn -> {:ok, "from db"} end,
   fn -> {:ok, "from api"} end
@@ -313,7 +318,7 @@ TaskExtension.first_ok([
 ### First OK Fallback
 
 ```elixir
-TaskExtension.first_ok([
+FirstOk.run([
   fn -> raise "primary down" end,
   fn -> {:error, :miss} end,
   fn -> :fallback end
@@ -321,10 +326,15 @@ TaskExtension.first_ok([
 # => {:ok, :fallback}
 ```
 
-### All Settled
+## AllSettled
+{: .col-2}
+
+### Collect All Results
 
 ```elixir
-TaskExtension.all_settled([
+alias Resiliency.AllSettled
+
+AllSettled.run([
   fn -> 1 end,
   fn -> raise "boom" end,
   fn -> 3 end
@@ -335,28 +345,33 @@ TaskExtension.all_settled([
 ### All Settled with Timeout
 
 ```elixir
-TaskExtension.all_settled([
+AllSettled.run([
   fn -> :quick end,
   fn -> Process.sleep(10_000); :slow end
 ], timeout: 1_000)
 # => [{:ok, :quick}, {:error, :timeout}]
 ```
 
-### Map
+## Map
+{: .col-2}
+
+### Basic Map
 
 ```elixir
-TaskExtension.map([1, 2, 3], fn x -> x * 2 end)
+alias Resiliency.Map
+
+Map.run([1, 2, 3], fn x -> x * 2 end)
 # => {:ok, [2, 4, 6]}
 ```
 
 ### Map with Bounded Concurrency
 
 ```elixir
-TaskExtension.map(urls, &fetch_url/1, max_concurrency: 10)
+Map.run(urls, &fetch_url/1, max_concurrency: 10)
 # => {:ok, [body1, body2, ...]}
 
 # cancels all on first failure
-TaskExtension.map(items, &process/1, max_concurrency: 5)
+Map.run(items, &process/1, max_concurrency: 5)
 # => {:error, reason}
 ```
 

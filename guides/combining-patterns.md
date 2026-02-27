@@ -551,7 +551,7 @@ hedged requests = 6 HTTP requests, all bounded by the semaphore.
 
 When combining multiple patterns, all stateful components -- `Hedged.Tracker`,
 `SingleFlight`, and `WeightedSemaphore` -- need to be started under a
-supervisor. `BackoffRetry` and `TaskExtension` are stateless and require no
+supervisor. `BackoffRetry`, `Race`, `AllSettled`, `Map`, and `FirstOk` are stateless and require no
 supervision.
 
 ### Grouping by domain

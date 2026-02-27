@@ -11,7 +11,10 @@ defmodule Resiliency do
     * `Resiliency.BackoffRetry` — Functional retry with composable, stream-based backoff strategies.
     * `Resiliency.Hedged` — Hedged requests: fire a backup after a delay, take whichever finishes first.
     * `Resiliency.SingleFlight` — Deduplicate concurrent function calls by key.
-    * `Resiliency.TaskExtension` — Higher-level Task combinators: `race`, `all_settled`, `map`, `first_ok`.
+    * `Resiliency.Race` — Run functions concurrently, return the first success, cancel the rest.
+    * `Resiliency.AllSettled` — Run functions concurrently, collect every result regardless of failures.
+    * `Resiliency.Map` — Map over an enumerable with bounded concurrency, cancel on first error.
+    * `Resiliency.FirstOk` — Try functions sequentially, return the first success.
     * `Resiliency.WeightedSemaphore` — Weighted semaphore for bounding concurrent access to a shared resource.
 
   ## Common API patterns
@@ -21,7 +24,7 @@ defmodule Resiliency do
   1. **Start** — Add the module to your supervision tree (where applicable).
      Only `Resiliency.Hedged` (adaptive mode), `Resiliency.SingleFlight`, and
      `Resiliency.WeightedSemaphore` require a running process. `BackoffRetry`,
-     `TaskExtension`, and stateless `Hedged.run/2` are purely functional.
+     `Race`, `AllSettled`, `Map`, `FirstOk`, and stateless `Hedged.run/2` are purely functional.
 
   2. **Call** — Wrap your operation in a zero-arity function and pass it to the
      module's primary entry point:
@@ -38,8 +41,8 @@ defmodule Resiliency do
          # SingleFlight
          Resiliency.SingleFlight.flight(MyFlights, "user:123", fn -> load_user(123) end)
 
-         # TaskExtension
-         Resiliency.TaskExtension.race([fn -> svc_a() end, fn -> svc_b() end])
+         # Race
+         Resiliency.Race.run([fn -> svc_a() end, fn -> svc_b() end])
 
          # WeightedSemaphore
          Resiliency.WeightedSemaphore.acquire(MySem, 3, fn -> bulk_insert(rows) end)
