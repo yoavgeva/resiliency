@@ -13,7 +13,7 @@ Add `resiliency` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:resiliency, "~> 0.1.0"}
+    {:resiliency, "~> 0.2.0"}
   ]
 end
 ```
