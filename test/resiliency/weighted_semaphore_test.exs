@@ -318,6 +318,23 @@ defmodule Resiliency.WeightedSemaphoreTest do
 
       gate_open(gate)
     end
+
+    test "invalid weight returns error" do
+      sem = start_sem!(max: 5)
+
+      assert {:error, :invalid_weight} =
+               Resiliency.WeightedSemaphore.try_acquire(sem, 0, fn -> :never end)
+
+      assert {:error, :invalid_weight} =
+               Resiliency.WeightedSemaphore.try_acquire(sem, -1, fn -> :never end)
+    end
+
+    test "weight exceeds max returns error immediately" do
+      sem = start_sem!(max: 5)
+
+      assert {:error, :weight_exceeds_max} =
+               Resiliency.WeightedSemaphore.try_acquire(sem, 6, fn -> :never end)
+    end
   end
 
   describe "timeout" do
@@ -338,6 +355,57 @@ defmodule Resiliency.WeightedSemaphoreTest do
                Resiliency.WeightedSemaphore.acquire(sem, 1, fn -> :never end, 100)
 
       gate_open(gate)
+    end
+
+    test "zombie waiter's function is not executed after caller times out and dies" do
+      sem = start_sem!(max: 1)
+      gate = gate_new()
+      zombie_executed = start_agent!(false)
+
+      # Hold the only permit
+      holder =
+        Task.async(fn ->
+          Resiliency.WeightedSemaphore.acquire(sem, 1, fn ->
+            gate_wait(gate)
+            :held
+          end)
+        end)
+
+      wait_until(fn -> current(sem) == 1 end)
+
+      # Spawn a process that will timeout and then die
+      caller =
+        spawn(fn ->
+          Resiliency.WeightedSemaphore.acquire(
+            sem,
+            1,
+            fn ->
+              Agent.update(zombie_executed, fn _ -> true end)
+              :zombie
+            end,
+            100
+          )
+
+          # After timeout, process exits naturally
+        end)
+
+      # Wait for the caller to timeout and die
+      ref = Process.monitor(caller)
+      assert_receive {:DOWN, ^ref, :process, ^caller, :normal}, 5_000
+
+      # Now release the holder — this triggers notify_waiters
+      gate_open(gate)
+      assert {:ok, :held} = Task.await(holder)
+
+      # Give the server time to process waiters
+      Process.sleep(100)
+
+      # The zombie waiter's function should NOT have been executed
+      refute Agent.get(zombie_executed, & &1),
+             "zombie waiter's function was executed despite caller being dead"
+
+      # Permits should be fully released (no permits wasted on zombie)
+      assert current(sem) == 0
     end
 
     test "caller timeout doesn't starve other waiters" do

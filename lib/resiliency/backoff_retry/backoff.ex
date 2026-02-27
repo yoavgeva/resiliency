@@ -9,15 +9,62 @@ defmodule Resiliency.BackoffRetry.Backoff do
       |> Resiliency.BackoffRetry.Backoff.jitter(0.25)
       |> Resiliency.BackoffRetry.Backoff.cap(10_000)
 
+  ## How it works
+
+  Every strategy is implemented with `Stream.unfold/2` or `Stream.repeatedly/1`,
+  producing an infinite lazy enumerable. Because streams are lazy, no delays are
+  computed until consumed — typically by `Enum.take/2` inside
+  `Resiliency.BackoffRetry.retry/2`.
+
+  **Exponential** — Each delay is the previous delay multiplied by a growth
+  factor (`:multiplier`, default 2). The sequence is `base, base * m, base * m^2,
+  base * m^3, ...`. Formally, the k-th delay (0-indexed) is
+  `d(k) = base * multiplier^k`. This strategy spreads retries further and further
+  apart, which is ideal when the downstream service needs progressively more time
+  to recover.
+
+  **Linear** — Each delay is the previous delay plus a fixed increment. The
+  sequence is `base, base + inc, base + 2*inc, ...`. Formally,
+  `d(k) = base + k * increment`. Growth is steady and predictable — useful when
+  you want moderate back-pressure without the aggressive growth of exponential.
+
+  **Constant** — Every delay is the same value: `delay, delay, delay, ...`.
+  Formally, `d(k) = delay` for all k. Best suited for idempotent health-check
+  pings or scenarios where the expected recovery time is roughly fixed.
+
+  **Jitter** — A decorator that adds uniform random noise to each delay value.
+  Given a proportion `p`, each delay `d` is replaced by a random value drawn
+  uniformly from `[d * (1 - p), d * (1 + p)]`, floored at 0. Jitter prevents
+  the "thundering herd" problem where many clients retry at exactly the same
+  instant.
+
+  **Cap** — A decorator that clamps each delay to a maximum value:
+  `min(d, max_delay)`. This ensures no single sleep exceeds a practical ceiling
+  regardless of how fast the underlying strategy grows.
+
+  ## Algorithm Complexity
+
+  | Function | Time | Space |
+  |---|---|---|
+  | `exponential/1` | O(1) to create the stream; O(1) per element consumed | O(1) — constant state in the stream accumulator |
+  | `linear/1` | O(1) to create the stream; O(1) per element consumed | O(1) |
+  | `constant/1` | O(1) to create the stream; O(1) per element consumed | O(1) |
+  | `jitter/2` | O(1) per element consumed | O(1) |
+  | `cap/2` | O(1) per element consumed | O(1) |
   """
 
   @doc """
   Produces an exponential backoff stream: `base`, `base * mult`, `base * mult^2`, ...
 
-  ## Options
+  ## Parameters
 
-    * `:base` — initial delay in ms (default: `100`)
-    * `:multiplier` — growth factor (default: `2`)
+  * `opts` -- keyword list of options. Defaults to `[]`.
+    * `:base` -- initial delay in milliseconds. Defaults to `100`.
+    * `:multiplier` -- growth factor applied each iteration. Defaults to `2`.
+
+  ## Returns
+
+  An infinite `Stream` of delay values in milliseconds, growing exponentially.
 
   ## Examples
 
@@ -41,10 +88,15 @@ defmodule Resiliency.BackoffRetry.Backoff do
   @doc """
   Produces a linear backoff stream: `base`, `base + inc`, `base + 2*inc`, ...
 
-  ## Options
+  ## Parameters
 
-    * `:base` — initial delay in ms (default: `100`)
-    * `:increment` — additive step per retry (default: `100`)
+  * `opts` -- keyword list of options. Defaults to `[]`.
+    * `:base` -- initial delay in milliseconds. Defaults to `100`.
+    * `:increment` -- additive step per retry in milliseconds. Defaults to `100`.
+
+  ## Returns
+
+  An infinite `Stream` of delay values in milliseconds, growing linearly.
 
   ## Examples
 
@@ -68,9 +120,14 @@ defmodule Resiliency.BackoffRetry.Backoff do
   @doc """
   Produces a constant backoff stream: `delay`, `delay`, `delay`, ...
 
-  ## Options
+  ## Parameters
 
-    * `:delay` — fixed delay in ms (default: `100`)
+  * `opts` -- keyword list of options. Defaults to `[]`.
+    * `:delay` -- fixed delay in milliseconds. Defaults to `100`.
+
+  ## Returns
+
+  An infinite `Stream` that repeatedly emits the same delay value in milliseconds.
 
   ## Examples
 
@@ -93,6 +150,15 @@ defmodule Resiliency.BackoffRetry.Backoff do
   Each delay `d` becomes a random value in `[d * (1 - proportion), d * (1 + proportion)]`,
   floored at `0`.
 
+  ## Parameters
+
+  * `delays` -- an `Enumerable` of delay values in milliseconds (typically a `Stream` from another backoff function).
+  * `proportion` -- the jitter fraction, controlling how much each delay can vary. Defaults to `0.25`.
+
+  ## Returns
+
+  A `Stream` of jittered delay values in milliseconds.
+
   ## Examples
 
       Resiliency.BackoffRetry.Backoff.exponential()
@@ -111,6 +177,15 @@ defmodule Resiliency.BackoffRetry.Backoff do
 
   @doc """
   Caps each delay at `max_delay` milliseconds.
+
+  ## Parameters
+
+  * `delays` -- an `Enumerable` of delay values in milliseconds (typically a `Stream` from another backoff function).
+  * `max_delay` -- the maximum delay in milliseconds. Any delay exceeding this value is clamped to it.
+
+  ## Returns
+
+  A `Stream` of delay values in milliseconds, each capped at `max_delay`.
 
   ## Examples
 

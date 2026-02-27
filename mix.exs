@@ -35,20 +35,41 @@ defmodule Resiliency.MixProject do
   defp package do
     [
       licenses: ["MIT"],
-      links: %{"GitHub" => @source_url}
+      links: %{"GitHub" => @source_url},
+      files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
     ]
   end
 
   defp docs do
     [
-      main: "Resiliency",
+      main: "readme",
       source_ref: "v#{@version}",
       source_url: @source_url,
+      extra_section: "GUIDES",
+      extras: [
+        "README.md",
+        "guides/getting-started.md",
+        "guides/choosing-a-pattern.md",
+        "guides/combining-patterns.md",
+        "guides/tuning-and-observability.md",
+        "cheatsheets/resiliency.cheatmd",
+        "LICENSE"
+      ],
+      groups_for_extras: [
+        Guides: [
+          "guides/getting-started.md",
+          "guides/choosing-a-pattern.md",
+          "guides/combining-patterns.md",
+          "guides/tuning-and-observability.md"
+        ],
+        Cheatsheets: [
+          "cheatsheets/resiliency.cheatmd"
+        ]
+      ],
       groups_for_modules: [
         Retry: [Resiliency.BackoffRetry, Resiliency.BackoffRetry.Backoff],
         "Hedged Requests": [
           Resiliency.Hedged,
-          Resiliency.Hedged.Runner,
           Resiliency.Hedged.Tracker,
           Resiliency.Hedged.Percentile
         ],

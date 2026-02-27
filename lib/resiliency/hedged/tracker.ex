@@ -7,6 +7,44 @@ defmodule Resiliency.Hedged.Tracker do
   hedge rate: each request credits a small amount, each hedge costs more,
   so hedging naturally throttles under load.
 
+  ## How it works
+
+  The tracker is a GenServer that holds two pieces of mutable state: a
+  `Resiliency.Hedged.Percentile` circular buffer of recent latency samples,
+  and a floating-point token bucket.
+
+  **Adaptive delay** — After every completed request, the caller records the
+  observed latency via `record/2`. The sample is added to the circular buffer
+  (see `Resiliency.Hedged.Percentile`). When `get_config/1` is called, the
+  tracker computes the configured percentile (e.g., p95) of the buffered
+  samples and clamps the result to `[min_delay, max_delay]`. Until at least
+  `:min_samples` observations have been recorded, the tracker returns
+  `:initial_delay` instead — a sensible default while the system warms up.
+
+  **Token bucket** — Each completed request credits `:token_success_credit`
+  tokens (default 0.1). Each hedge that fires costs `:token_hedge_cost`
+  tokens (default 1.0). Hedging is only allowed when the bucket contains at
+  least `:token_threshold` tokens. Because a hedge costs 10x what a success
+  earns, hedging naturally throttles to roughly 10% of traffic under
+  sustained load. If hedges consistently win (indicating a real latency
+  problem rather than a transient spike), the bucket refills quickly and
+  hedging continues. If hedges rarely help, the bucket drains and hedging
+  pauses — protecting the downstream service from unnecessary duplicate load.
+
+  **Statistics** — `stats/1` returns a snapshot of counters (total requests,
+  hedged requests, hedge wins), percentiles (p50, p95, p99), the current
+  adaptive delay, and the token bucket level. This is useful for dashboards
+  and alerting.
+
+  ## Algorithm Complexity
+
+  | Function | Time | Space |
+  |---|---|---|
+  | `start_link/1` | O(1) | O(1) — empty buffer and initial token bucket |
+  | `get_config/1` | O(1) — percentile lookup is O(1) via tuple indexing | O(1) |
+  | `record/2` | O(n) where n = `buffer_size` — sorted insert/delete on the internal sorted list | O(n) — the circular buffer holds at most n samples |
+  | `stats/1` | O(1) — percentile lookups are O(1) | O(1) |
+
   ## Usage
 
       {:ok, _} = Resiliency.Hedged.Tracker.start_link(name: MyTracker)
@@ -66,6 +104,18 @@ defmodule Resiliency.Hedged.Tracker do
 
   Requires a `:name` option. See module documentation for all options.
 
+  ## Parameters
+
+  * `opts` -- keyword list of options. See the module documentation for the full list. The `:name` option is required.
+
+  ## Returns
+
+  `{:ok, pid}` on success, or `{:error, reason}` if the process cannot be started.
+
+  ## Raises
+
+  Raises `KeyError` if the required `:name` option is not provided.
+
   ## Examples
 
       {:ok, _pid} = Resiliency.Hedged.Tracker.start_link(name: MyTracker)
@@ -88,6 +138,14 @@ defmodule Resiliency.Hedged.Tracker do
 
   Hedging is allowed when the token bucket has at least `:token_threshold`
   tokens remaining.
+
+  ## Parameters
+
+  * `server` -- the name or PID of a running `Resiliency.Hedged.Tracker` process.
+
+  ## Returns
+
+  A tuple `{delay_ms, allow_hedge?}` where `delay_ms` is a non-negative integer representing the adaptive delay in milliseconds, and `allow_hedge?` is a boolean indicating whether the token bucket permits hedging.
   """
   @spec get_config(GenServer.server()) :: {non_neg_integer(), boolean()}
   def get_config(server) do
@@ -105,6 +163,15 @@ defmodule Resiliency.Hedged.Tracker do
 
   The latency sample feeds the percentile buffer, while `:hedged?` and
   `:hedge_won?` update the token bucket and counters.
+
+  ## Parameters
+
+  * `server` -- the name or PID of a running `Resiliency.Hedged.Tracker` process.
+  * `observation` -- a map containing `:latency_ms` (number), `:hedged?` (boolean), and `:hedge_won?` (boolean).
+
+  ## Returns
+
+  `:ok`. The observation is processed asynchronously via `GenServer.cast/2`.
   """
   @spec record(GenServer.server(), map()) :: :ok
   def record(server, observation) do
@@ -122,6 +189,14 @@ defmodule Resiliency.Hedged.Tracker do
     * `:p50`, `:p95`, `:p99` — latency percentiles from the sample buffer
     * `:current_delay` — adaptive delay that would be returned by `get_config/1`
     * `:tokens` — current token bucket level
+
+  ## Parameters
+
+  * `server` -- the name or PID of a running `Resiliency.Hedged.Tracker` process.
+
+  ## Returns
+
+  A map with keys `:total_requests`, `:hedged_requests`, `:hedge_won`, `:p50`, `:p95`, `:p99`, `:current_delay`, and `:tokens`.
   """
   @spec stats(GenServer.server()) :: map()
   def stats(server) do
@@ -159,6 +234,7 @@ defmodule Resiliency.Hedged.Tracker do
     {:reply, {delay, allow_hedge?}, state}
   end
 
+  @impl true
   def handle_call(:stats, _from, state) do
     stats =
       Map.merge(state.stats, %{

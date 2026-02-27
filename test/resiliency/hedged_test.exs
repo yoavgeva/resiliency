@@ -104,6 +104,11 @@ defmodule Resiliency.HedgedTest do
       assert {:ok, 42} = Resiliency.Hedged.run(tracker, fn -> {:ok, 42} end, [])
     end
 
+    test "run/2 convenience clause works without opts", %{tracker: tracker} do
+      result = Resiliency.Hedged.run(tracker, fn -> {:ok, 42} end)
+      assert {:ok, 42} = result
+    end
+
     test "returns {:error, reason} on failure", %{tracker: tracker} do
       assert {:error, :boom} =
                Resiliency.Hedged.run(tracker, fn -> {:error, :boom} end, max_requests: 1)

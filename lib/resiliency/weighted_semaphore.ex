@@ -11,6 +11,20 @@ defmodule Resiliency.WeightedSemaphore do
   with an Elixir-idiomatic API that auto-releases permits when the function
   completes or crashes — eliminating permit leaks entirely.
 
+  ## When to use
+
+    * Limiting concurrent database connections from a pool of workers — each
+      query costs 1 permit, a bulk import costs N permits, ensuring the total
+      never exceeds the connection limit.
+    * Throttling outbound HTTP requests to a rate-limited third-party API —
+      e.g., allowing at most 5 concurrent calls to a payment gateway.
+    * Bounding memory-intensive operations such as image processing or CSV
+      parsing where each job has a different memory footprint — assign weight
+      proportional to estimated memory so the system stays within safe limits.
+    * Protecting a shared file system or disk queue from too many concurrent
+      writers, where a large batch write should block smaller writes to avoid
+      I/O contention.
+
   ## Quick start
 
       # 1. Add to your supervision tree
@@ -67,6 +81,17 @@ defmodule Resiliency.WeightedSemaphore do
         Resiliency.WeightedSemaphore.acquire(MyApp.Sem, fn -> exit(:oops) end)
 
   In all cases, permits are freed and the next queued caller proceeds.
+
+  ## Algorithm Complexity
+
+  | Function | Time | Space |
+  |---|---|---|
+  | `start_link/1` | O(1) | O(1) |
+  | `child_spec/1` | O(1) | O(1) |
+  | `acquire/2` | O(1) GenServer call + O(q) queue drain on release, where q = queued waiters | O(q) — one entry per queued waiter |
+  | `acquire/3,4` | O(1) GenServer call + O(q) queue drain on release | O(q) |
+  | `try_acquire/2` | O(1) — immediate accept or reject, no queue interaction | O(1) |
+  | `try_acquire/3` | O(1) | O(1) |
   """
 
   @typedoc "A semaphore reference — a registered name, PID, or `{:via, ...}` tuple."
@@ -78,10 +103,19 @@ defmodule Resiliency.WeightedSemaphore do
   @doc """
   Returns a child specification for starting under a supervisor.
 
-  ## Options
+  ## Parameters
 
-    * `:name` (required) — the name to register the semaphore under
-    * `:max` (required) — the maximum total weight (number of permits)
+  * `opts` -- keyword list of options.
+    * `:name` -- (required) the name to register the semaphore under.
+    * `:max` -- (required) the maximum total weight (number of permits).
+
+  ## Returns
+
+  A `Supervisor.child_spec()` map suitable for inclusion in a supervision tree.
+
+  ## Raises
+
+  Raises `KeyError` if the required `:name` option is not provided.
 
   ## Examples
 
@@ -114,6 +148,16 @@ defmodule Resiliency.WeightedSemaphore do
   Typically you'd use `child_spec/1` instead to start under a supervisor.
   See `child_spec/1` for options.
 
+  ## Parameters
+
+  * `opts` -- keyword list of options.
+    * `:name` -- (required) the name to register the semaphore under.
+    * `:max` -- (required) the maximum total weight (number of permits).
+
+  ## Returns
+
+  `{:ok, pid}` on success, or `{:error, reason}` if the process cannot be started.
+
   ## Examples
 
       {:ok, pid} = Resiliency.WeightedSemaphore.start_link(name: MyApp.Sem, max: 10)
@@ -129,6 +173,15 @@ defmodule Resiliency.WeightedSemaphore do
   Blocks until a permit is available. The function runs in a separate
   process — if it raises, exits, or throws, the error is returned and
   permits are still released.
+
+  ## Parameters
+
+  * `sem` -- the name or PID of a running `Resiliency.WeightedSemaphore` server.
+  * `fun` -- a zero-arity function to execute once the permit is acquired.
+
+  ## Returns
+
+  `{:ok, result}` on success, or `{:error, reason}` if the function raises, exits, or throws.
 
   ## Examples
 
@@ -151,6 +204,17 @@ defmodule Resiliency.WeightedSemaphore do
 
   Returns `{:error, :weight_exceeds_max}` immediately if `weight` is larger
   than the semaphore's total capacity.
+
+  ## Parameters
+
+  * `sem` -- the name or PID of a running `Resiliency.WeightedSemaphore` server.
+  * `weight` -- the number of permits to acquire. Must be a positive integer.
+  * `fun` -- a zero-arity function to execute once the permits are acquired.
+  * `timeout` -- optional caller-side timeout in milliseconds or `:infinity`. Defaults to `:infinity`.
+
+  ## Returns
+
+  `{:ok, result}` on success, `{:error, :weight_exceeds_max}` if `weight` exceeds the semaphore's max capacity, `{:error, :timeout}` if the timeout expires before permits are available, or `{:error, reason}` if the function raises, exits, or throws.
 
   ## Examples
 
@@ -184,6 +248,15 @@ defmodule Resiliency.WeightedSemaphore do
   This is useful for "best effort" work that can be skipped when the
   system is under load.
 
+  ## Parameters
+
+  * `sem` -- the name or PID of a running `Resiliency.WeightedSemaphore` server.
+  * `fun` -- a zero-arity function to execute if the permit is acquired.
+
+  ## Returns
+
+  `{:ok, result}` on success, `:rejected` if no permit is available or there are waiters in the queue, or `{:error, reason}` if the function raises, exits, or throws.
+
   ## Examples
 
       iex> {:ok, _pid} = Resiliency.WeightedSemaphore.start_link(name: :try1_sem, max: 3)
@@ -205,6 +278,16 @@ defmodule Resiliency.WeightedSemaphore do
 
   Note that `:rejected` is returned even if enough raw capacity exists
   but there are waiters in the queue — this preserves FIFO fairness.
+
+  ## Parameters
+
+  * `sem` -- the name or PID of a running `Resiliency.WeightedSemaphore` server.
+  * `weight` -- the number of permits to acquire. Must be a positive integer.
+  * `fun` -- a zero-arity function to execute if permits are acquired.
+
+  ## Returns
+
+  `{:ok, result}` on success, `:rejected` if insufficient permits are available or there are waiters in the queue, `{:error, :weight_exceeds_max}` if `weight` exceeds the semaphore's max capacity, or `{:error, reason}` if the function raises, exits, or throws.
 
   ## Examples
 

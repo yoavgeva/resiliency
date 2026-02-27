@@ -1,0 +1,447 @@
+# Resiliency
+
+## BackoffRetry
+{: .col-2}
+
+### Basic Retry
+
+```elixir
+alias Resiliency.BackoffRetry
+
+# Defaults: 3 attempts, exponential backoff
+{:ok, body} = BackoffRetry.retry(fn -> fetch(url) end)
+# => {:ok, %{"data" => ...}}
+```
+
+### With Options
+
+```elixir
+BackoffRetry.retry(fn -> fetch(url) end,
+  backoff: :exponential,
+  max_attempts: 5,
+  base_delay: 200,
+  max_delay: 10_000,
+  budget: 30_000
+)
+```
+
+### Retry If
+
+```elixir
+BackoffRetry.retry(fn -> fetch(url) end,
+  retry_if: fn
+    {:error, :timeout} -> true
+    {:error, :econnrefused} -> true
+    _ -> false
+  end
+)
+```
+
+### On Retry Callback
+
+```elixir
+BackoffRetry.retry(fn -> fetch(url) end,
+  on_retry: fn attempt, delay, error ->
+    Logger.warning("Attempt #{attempt}, #{delay}ms: #{inspect(error)}")
+  end
+)
+```
+
+### Reraise Exceptions
+
+```elixir
+# Re-raises rescued exceptions with original stacktrace
+BackoffRetry.retry(fn -> might_raise() end,
+  reraise: true,
+  max_attempts: 3
+)
+```
+
+### Exponential Backoff
+
+```elixir
+alias Resiliency.BackoffRetry.Backoff
+
+Backoff.exponential() |> Enum.take(4)
+# => [100, 200, 400, 800]
+
+Backoff.exponential(base: 50, multiplier: 3) |> Enum.take(3)
+# => [50, 150, 450]
+```
+
+### Linear Backoff
+
+```elixir
+Backoff.linear() |> Enum.take(4)
+# => [100, 200, 300, 400]
+
+Backoff.linear(base: 50, increment: 50) |> Enum.take(3)
+# => [50, 100, 150]
+```
+
+### Constant Backoff
+
+```elixir
+Backoff.constant() |> Enum.take(3)
+# => [100, 100, 100]
+
+Backoff.constant(delay: 500) |> Enum.take(3)
+# => [500, 500, 500]
+```
+
+### Jitter & Cap
+
+```elixir
+Backoff.exponential(base: 200)
+|> Backoff.jitter(0.25)   # +/- 25% random
+|> Backoff.cap(10_000)    # ceiling at 10s
+|> Enum.take(5)
+
+Backoff.exponential(base: 1000) |> Backoff.cap(5000) |> Enum.take(5)
+# => [1000, 2000, 4000, 5000, 5000]
+```
+
+### Custom Delay Stream
+
+```elixir
+BackoffRetry.retry(fn -> fetch(url) end,
+  backoff: [100, 500, 2_000, 5_000]
+)
+```
+
+### Abort Early
+
+```elixir
+BackoffRetry.retry(fn ->
+  case api_call() do
+    {:error, :not_found} ->
+      {:error, BackoffRetry.abort(:not_found)}
+    other -> other
+  end
+end)
+# => {:error, :not_found}  (no further retries)
+```
+
+### Testable Sleep
+
+```elixir
+BackoffRetry.retry(fn -> fetch(url) end,
+  sleep_fn: fn _ms -> :ok end  # skip sleep in tests
+)
+```
+
+## Hedged Requests
+{: .col-2}
+
+### Stateless with Fixed Delay
+
+```elixir
+alias Resiliency.Hedged
+
+Hedged.run(fn -> fetch(url) end, delay: 100)
+# => {:ok, body}  (hedge fires after 100ms if needed)
+```
+
+### Stateless Options
+
+```elixir
+Hedged.run(fn -> fetch(url) end,
+  delay: 200,
+  max_requests: 3,
+  timeout: 5_000
+)
+```
+
+### Non-Fatal Immediate Hedge
+
+```elixir
+Hedged.run(fn -> fetch(url) end,
+  non_fatal: fn :econnrefused -> true; _ -> false end
+)
+# fires next hedge immediately on :econnrefused
+```
+
+### On Hedge Callback
+
+```elixir
+Hedged.run(fn -> fetch(url) end,
+  on_hedge: fn attempt ->
+    Logger.info("Hedge ##{attempt} fired")
+  end
+)
+```
+
+### Stateful Adaptive Mode
+
+```elixir
+# Start tracker (add to supervision tree)
+{:ok, _} = Hedged.start_link(name: MyHedge)
+
+# Delay auto-tunes from observed latency
+{:ok, body} = Hedged.run(MyHedge, fn -> fetch(url) end)
+```
+
+### Supervision Tree
+
+```elixir
+children = [
+  {Resiliency.Hedged, name: MyHedge, percentile: 99}
+]
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+### Tracker Config
+
+```elixir
+Hedged.start_link(
+  name: MyHedge,
+  percentile: 95,      # target latency percentile
+  buffer_size: 1000,   # max latency samples
+  min_delay: 1,        # floor ms
+  max_delay: 5_000,    # ceiling ms
+  initial_delay: 100,  # before enough samples
+  min_samples: 10      # samples before adapting
+)
+```
+
+### Tracker Stats
+
+```elixir
+alias Resiliency.Hedged.Tracker
+
+stats = Tracker.stats(MyHedge)
+# => %{
+#   total_requests: 1042,
+#   hedged_requests: 87,
+#   hedge_won: 34,
+#   p50: 12, p95: 48, p99: 120,
+#   current_delay: 48,
+#   tokens: 7.2
+# }
+```
+
+## SingleFlight
+{: .col-2}
+
+### Start
+
+```elixir
+# In supervision tree
+children = [
+  {Resiliency.SingleFlight, name: MyApp.Flights}
+]
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+### Basic Dedup
+
+```elixir
+alias Resiliency.SingleFlight
+
+# Only one execution per key, others share the result
+{:ok, user} = SingleFlight.flight(MyApp.Flights, "user:123", fn ->
+  Repo.get!(User, 123)
+end)
+# => {:ok, %User{id: 123}}
+```
+
+### With Timeout
+
+```elixir
+SingleFlight.flight(MyApp.Flights, "slow-key", fn ->
+  :timer.sleep(5_000)
+  :result
+end, 1_000)
+# => ** (exit) timeout after 1000ms
+# in-flight function continues for other waiters
+```
+
+### Error Handling
+
+```elixir
+{:error, {%RuntimeError{message: "boom"}, _stack}} =
+  SingleFlight.flight(MyApp.Flights, "bad", fn ->
+    raise "boom"
+  end)
+# all waiters receive the same error
+```
+
+### Forget Key
+
+```elixir
+# Evict a key so the next call starts fresh
+:ok = SingleFlight.forget(MyApp.Flights, "user:123")
+# existing waiters still get original result
+# new callers trigger a fresh execution
+```
+
+## TaskExtension
+{: .col-2}
+
+### Race
+
+```elixir
+alias Resiliency.TaskExtension
+
+TaskExtension.race([
+  fn -> Process.sleep(100); :slow end,
+  fn -> :fast end
+])
+# => {:ok, :fast}  (losers are cancelled)
+```
+
+### Race with Timeout
+
+```elixir
+TaskExtension.race([
+  fn -> Process.sleep(10_000); :too_slow end
+], timeout: 1_000)
+# => {:error, :timeout}
+```
+
+### First OK
+
+```elixir
+TaskExtension.first_ok([
+  fn -> {:error, :cache_miss} end,
+  fn -> {:ok, "from db"} end,
+  fn -> {:ok, "from api"} end
+])
+# => {:ok, "from db"}  (sequential, stops at first success)
+```
+
+### First OK Fallback
+
+```elixir
+TaskExtension.first_ok([
+  fn -> raise "primary down" end,
+  fn -> {:error, :miss} end,
+  fn -> :fallback end
+])
+# => {:ok, :fallback}
+```
+
+### All Settled
+
+```elixir
+TaskExtension.all_settled([
+  fn -> 1 end,
+  fn -> raise "boom" end,
+  fn -> 3 end
+])
+# => [{:ok, 1}, {:error, {%RuntimeError{...}, _}}, {:ok, 3}]
+```
+
+### All Settled with Timeout
+
+```elixir
+TaskExtension.all_settled([
+  fn -> :quick end,
+  fn -> Process.sleep(10_000); :slow end
+], timeout: 1_000)
+# => [{:ok, :quick}, {:error, :timeout}]
+```
+
+### Map
+
+```elixir
+TaskExtension.map([1, 2, 3], fn x -> x * 2 end)
+# => {:ok, [2, 4, 6]}
+```
+
+### Map with Bounded Concurrency
+
+```elixir
+TaskExtension.map(urls, &fetch_url/1, max_concurrency: 10)
+# => {:ok, [body1, body2, ...]}
+
+# cancels all on first failure
+TaskExtension.map(items, &process/1, max_concurrency: 5)
+# => {:error, reason}
+```
+
+## WeightedSemaphore
+{: .col-2}
+
+### Start
+
+```elixir
+# In supervision tree
+children = [
+  {Resiliency.WeightedSemaphore, name: MyApp.Sem, max: 10}
+]
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+### Acquire (Blocking)
+
+```elixir
+alias Resiliency.WeightedSemaphore
+
+# Acquires 1 permit, auto-releases on completion
+{:ok, user} = WeightedSemaphore.acquire(MyApp.Sem, fn ->
+  Repo.get!(User, 123)
+end)
+# => {:ok, %User{id: 123}}
+```
+
+### Acquire with Timeout
+
+```elixir
+WeightedSemaphore.acquire(MyApp.Sem, 1, fn ->
+  :work
+end, 5_000)
+# => {:error, :timeout}  (if permits not available in 5s)
+```
+
+### Custom Weights
+
+```elixir
+# Lightweight read: 1 permit
+{:ok, row} = WeightedSemaphore.acquire(MyApp.Sem, 1, fn ->
+  Repo.get(Item, 1)
+end)
+
+# Heavy bulk insert: 5 permits
+{:ok, _} = WeightedSemaphore.acquire(MyApp.Sem, 5, fn ->
+  Repo.insert_all(Item, rows)
+end)
+```
+
+### Weight Exceeds Max
+
+```elixir
+# max: 10, requesting 11 -> immediate error
+WeightedSemaphore.acquire(MyApp.Sem, 11, fn -> :never end)
+# => {:error, :weight_exceeds_max}
+```
+
+### Try Acquire (Non-Blocking)
+
+```elixir
+case WeightedSemaphore.try_acquire(MyApp.Sem, fn -> :work end) do
+  {:ok, result} -> result
+  :rejected -> :skipped  # no permits available
+end
+```
+
+### Try Acquire with Weight
+
+```elixir
+WeightedSemaphore.try_acquire(MyApp.Sem, 3, fn ->
+  expensive_operation()
+end)
+# => {:ok, result} | :rejected
+```
+
+### Error Handling
+
+```elixir
+# Permits auto-release even on crash
+{:error, {%RuntimeError{}, _stack}} =
+  WeightedSemaphore.acquire(MyApp.Sem, fn -> raise "boom" end)
+
+{:error, :oops} =
+  WeightedSemaphore.acquire(MyApp.Sem, fn -> exit(:oops) end)
+# next queued caller proceeds automatically
+```

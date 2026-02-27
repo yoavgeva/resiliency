@@ -1,5 +1,9 @@
 # Resiliency
 
+[![CI](https://github.com/yoavgeva/resiliency/actions/workflows/ci.yml/badge.svg)](https://github.com/yoavgeva/resiliency/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/resiliency.svg)](https://hex.pm/packages/resiliency)
+[![Docs](https://img.shields.io/badge/docs-hexdocs-blue.svg)](https://hexdocs.pm/resiliency)
+
 A collection of resilience and concurrency primitives for Elixir.
 
 | Module | Description |
@@ -27,13 +31,13 @@ end
 ### BackoffRetry
 
 ```elixir
-Resiliency.BackoffRetry.retry(max_retries: 3, backoff: :exponential) do
+Resiliency.BackoffRetry.retry(fn ->
   case HttpClient.get(url) do
     {:ok, %{status: 200}} = success -> success
     {:ok, %{status: 503}} -> raise "service unavailable"
     {:error, reason} -> raise "request failed: #{inspect(reason)}"
   end
-end
+end, max_attempts: 3, backoff: :exponential)
 ```
 
 ### Hedged
@@ -43,7 +47,7 @@ end
 {:ok, tracker} = Resiliency.Hedged.start_link(name: :my_hedged, percentile: 95)
 
 # Hedged call — sends a backup request if the first is slower than p95
-{:ok, result} = Resiliency.Hedged.run(:my_hedged, fn -> expensive_call() end)
+{:ok, result} = Resiliency.Hedged.run(:my_hedged, fn -> expensive_call() end, [])
 ```
 
 ### SingleFlight

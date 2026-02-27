@@ -7,8 +7,62 @@ defmodule Resiliency.TaskExtension do
   Go's `errgroup`, Java's `CompletableFuture`) but missing from Elixir's stdlib.
 
   All functions are stateless — no GenServer to start, no supervision tree entry.
-  Each call starts a temporary `Task.Supervisor` internally and cleans it up when done.
-  Spawned tasks use `async_nolink`, so task crashes never crash the caller.
+  Spawned tasks use `spawn_monitor` with a handshake, so task crashes never crash
+  the caller.
+
+  ## When to use
+
+    * Querying multiple replicas or services in parallel and using whichever
+      responds first (`race/1`) — e.g., hitting a primary and a read-replica
+      simultaneously for a latency-sensitive endpoint.
+    * Running a batch of independent jobs where partial failure is acceptable
+      and you need to know which succeeded (`all_settled/1`) — e.g., sending
+      notifications to multiple channels.
+    * Processing a collection with bounded parallelism and fail-fast semantics
+      (`map/3`) — e.g., uploading files to S3 with at most 10 concurrent
+      streams, aborting on the first permission error.
+    * Implementing a fallback chain across cache, database, and remote API
+      (`first_ok/1`) — each layer is tried sequentially, stopping at the
+      first success.
+
+  ## How it works
+
+  **`race/1`** — All functions are spawned concurrently as monitored
+  processes. The caller enters a receive loop: the first task to send a
+  successful result wins, all remaining tasks are killed via
+  `Process.exit(pid, :kill)`, and `{:ok, result}` is returned. If a task
+  crashes (`:DOWN` message), it is removed from the active set and the race
+  continues with the survivors. If all tasks crash, `{:error, :all_failed}`
+  is returned.
+
+  **`all_settled/1`** — Similar to `race`, but the caller waits for every
+  task to complete. Results are collected into an Erlang `:array` indexed by
+  input position, so the output order always matches the input order
+  regardless of completion order. Each slot is `{:ok, value}` or
+  `{:error, reason}`. Tasks exceeding the timeout receive
+  `{:error, :timeout}`.
+
+  **`map/3`** — Items are processed with a sliding window of at most
+  `:max_concurrency` tasks. When a task completes, its result is stored and
+  the next pending item is spawned. If any task crashes, all active tasks are
+  killed and `{:error, reason}` is returned immediately — no further items
+  are started. On success, `{:ok, results}` is returned in input order.
+
+  **`first_ok/1`** — Functions are tried sequentially (not concurrently).
+  The first function that returns a non-error value wins. Exceptions, exits,
+  throws, and `{:error, _}` tuples are treated as failures, and the next
+  function is tried. If all fail, `{:error, :all_failed}` is returned. A
+  total `:timeout` can be set — elapsed time is subtracted after each
+  attempt.
+
+  ## Algorithm Complexity
+
+  | Function | Time | Space |
+  |---|---|---|
+  | `race/1` | O(n) spawns + O(n) monitor cleanup where n = number of functions | O(n) — one monitored process per function |
+  | `all_settled/1` | O(n) spawns + O(n) result collection | O(n) — `:array` of results + monitored processes |
+  | `map/3` | O(n) total spawns where n = number of items, at most c concurrent where c = `max_concurrency` | O(n + c) — `:array` of n results + c active monitored processes |
+  | `first_ok/1` | O(n) sequential calls in the worst case | O(1) — only one function executes at a time |
 
   ## Usage
 
@@ -58,9 +112,15 @@ defmodule Resiliency.TaskExtension do
   If no function succeeds within the timeout, returns `{:error, :timeout}`.
   An empty list returns `{:error, :empty}`.
 
-  ## Options
+  ## Parameters
 
-    * `timeout` — milliseconds or `:infinity` (default: `:infinity`)
+  * `funs` -- a list of zero-arity functions to race concurrently.
+  * `opts` -- keyword list of options. Defaults to `[]`.
+    * `:timeout` -- milliseconds or `:infinity`. Defaults to `:infinity`.
+
+  ## Returns
+
+  `{:ok, result}` from the first function that completes successfully, `{:error, :all_failed}` if all functions fail, `{:error, :timeout}` if no function succeeds within the timeout, or `{:error, :empty}` if the input list is empty.
 
   ## Examples
 
@@ -103,19 +163,10 @@ defmodule Resiliency.TaskExtension do
 
   def race(funs, opts) do
     timeout = Keyword.get(opts, :timeout, :infinity)
-    {:ok, sup} = Task.Supervisor.start_link()
 
-    try do
-      tasks =
-        Enum.map(funs, fn fun ->
-          Task.Supervisor.async_nolink(sup, fun)
-        end)
-
-      task_set = Map.new(tasks, fn task -> {task.ref, task} end)
-      do_race(task_set, map_size(task_set), timeout)
-    after
-      shutdown_supervisor(sup)
-    end
+    tasks = Enum.map(funs, &spawn_task/1)
+    task_set = Map.new(tasks, fn task -> {task.ref, task} end)
+    do_race(task_set, map_size(task_set), timeout)
   end
 
   defp do_race(_task_set, 0, _timeout), do: {:error, :all_failed}
@@ -151,9 +202,15 @@ defmodule Resiliency.TaskExtension do
 
   Returns `[]` for an empty list.
 
-  ## Options
+  ## Parameters
 
-    * `timeout` — milliseconds or `:infinity` (default: `:infinity`)
+  * `funs` -- a list of zero-arity functions to execute concurrently.
+  * `opts` -- keyword list of options. Defaults to `[]`.
+    * `:timeout` -- milliseconds or `:infinity`. Defaults to `:infinity`.
+
+  ## Returns
+
+  A list of `{:ok, value}` or `{:error, reason}` tuples in the same order as the input list. Tasks that exceed the timeout produce `{:error, :timeout}`. An empty input list returns `[]`.
 
   ## Examples
 
@@ -189,24 +246,15 @@ defmodule Resiliency.TaskExtension do
 
   def all_settled(funs, opts) do
     timeout = Keyword.get(opts, :timeout, :infinity)
-    {:ok, sup} = Task.Supervisor.start_link()
 
-    try do
-      tasks =
-        Enum.map(funs, fn fun ->
-          Task.Supervisor.async_nolink(sup, fun)
-        end)
+    tasks = Enum.map(funs, &spawn_task/1)
+    ref_to_index = Map.new(Enum.with_index(tasks), fn {task, i} -> {task.ref, i} end)
+    results = :array.new(length(tasks), default: nil)
 
-      ref_to_index = Map.new(Enum.with_index(tasks), fn {task, i} -> {task.ref, i} end)
-      results = :array.new(length(tasks), default: nil)
+    results = collect_all(tasks, ref_to_index, results, length(tasks), timeout)
 
-      results = collect_all(tasks, ref_to_index, results, length(tasks), timeout)
-
-      for i <- 0..(length(tasks) - 1) do
-        :array.get(i, results)
-      end
-    after
-      shutdown_supervisor(sup)
+    for i <- 0..(length(tasks) - 1) do
+      :array.get(i, results)
     end
   end
 
@@ -254,10 +302,17 @@ defmodule Resiliency.TaskExtension do
 
   Returns `{:ok, []}` for an empty enumerable.
 
-  ## Options
+  ## Parameters
 
-    * `max_concurrency` — max tasks running at once (default: `System.schedulers_online()`)
-    * `timeout` — milliseconds or `:infinity` (default: `:infinity`)
+  * `enumerable` -- any `Enumerable` of items to map over.
+  * `fun` -- a one-arity function to apply to each item.
+  * `opts` -- keyword list of options. Defaults to `[]`.
+    * `:max_concurrency` -- max tasks running at once. Defaults to `System.schedulers_online()`.
+    * `:timeout` -- milliseconds or `:infinity`. Defaults to `:infinity`.
+
+  ## Returns
+
+  `{:ok, results}` where `results` is a list of return values in input order, or `{:error, reason}` on the first task failure or timeout.
 
   ## Examples
 
@@ -287,17 +342,11 @@ defmodule Resiliency.TaskExtension do
       _ ->
         max_concurrency = Keyword.get(opts, :max_concurrency, System.schedulers_online())
         timeout = Keyword.get(opts, :timeout, :infinity)
-        {:ok, sup} = Task.Supervisor.start_link()
-
-        try do
-          do_map(sup, items, fun, max_concurrency, timeout)
-        after
-          shutdown_supervisor(sup)
-        end
+        do_map(items, fun, max_concurrency, timeout)
     end
   end
 
-  defp do_map(sup, items, fun, max_concurrency, timeout) do
+  defp do_map(items, fun, max_concurrency, timeout) do
     indexed = Enum.with_index(items)
     results = :array.new(length(items), default: nil)
 
@@ -305,14 +354,14 @@ defmodule Resiliency.TaskExtension do
 
     active =
       Map.new(initial_batch, fn {item, index} ->
-        task = Task.Supervisor.async_nolink(sup, fn -> fun.(item) end)
+        task = spawn_task(fn -> fun.(item) end)
         {task.ref, {task, index}}
       end)
 
-    collect_map(active, rest, results, fun, sup, length(items), timeout)
+    collect_map(active, rest, results, fun, length(items), timeout)
   end
 
-  defp collect_map(active, _pending, results, _fun, _sup, total, _timeout)
+  defp collect_map(active, _pending, results, _fun, total, _timeout)
        when map_size(active) == 0 do
     collected =
       for i <- 0..(total - 1) do
@@ -322,7 +371,7 @@ defmodule Resiliency.TaskExtension do
     {:ok, collected}
   end
 
-  defp collect_map(active, pending, results, fun, sup, total, timeout) do
+  defp collect_map(active, pending, results, fun, total, timeout) do
     start = System.monotonic_time(:millisecond)
 
     receive do
@@ -335,7 +384,7 @@ defmodule Resiliency.TaskExtension do
         {active, pending} =
           case pending do
             [{item, idx} | rest] ->
-              task = Task.Supervisor.async_nolink(sup, fn -> fun.(item) end)
+              task = spawn_task(fn -> fun.(item) end)
               {Map.put(active, task.ref, {task, idx}), rest}
 
             [] ->
@@ -344,7 +393,7 @@ defmodule Resiliency.TaskExtension do
 
         elapsed = System.monotonic_time(:millisecond) - start
         new_timeout = remaining_timeout(timeout, elapsed)
-        collect_map(active, pending, results, fun, sup, total, new_timeout)
+        collect_map(active, pending, results, fun, total, new_timeout)
 
       {:DOWN, ref, _, _, reason} when is_map_key(active, ref) ->
         active_tasks = for {_ref, {task, _idx}} <- Map.delete(active, ref), do: task
@@ -373,10 +422,15 @@ defmodule Resiliency.TaskExtension do
   Returns `{:error, :all_failed}` if all functions fail.
   Returns `{:error, :empty}` for an empty list.
 
-  ## Options
+  ## Parameters
 
-    * `timeout` — total timeout across all attempts, in milliseconds
-      or `:infinity` (default: `:infinity`)
+  * `funs` -- a list of zero-arity functions to try sequentially.
+  * `opts` -- keyword list of options. Defaults to `[]`.
+    * `:timeout` -- total timeout across all attempts, in milliseconds or `:infinity`. Defaults to `:infinity`.
+
+  ## Returns
+
+  `{:ok, result}` from the first function that succeeds, `{:error, :all_failed}` if all functions fail or the timeout expires, or `{:error, :empty}` if the input list is empty.
 
   ## Examples
 
@@ -458,16 +512,42 @@ defmodule Resiliency.TaskExtension do
 
   # Helpers
 
-  defp shutdown_tasks(tasks) do
-    Enum.each(tasks, fn task ->
-      Task.shutdown(task, :brutal_kill)
-    end)
+  defp spawn_task(fun) do
+    caller = self()
+    owner_ref = make_ref()
+
+    pid =
+      spawn(fn ->
+        mref =
+          receive do
+            {^owner_ref, mref} -> mref
+          end
+
+        try do
+          result = fun.()
+          send(caller, {mref, result})
+        rescue
+          e ->
+            exit({e, __STACKTRACE__})
+        catch
+          :exit, reason ->
+            exit(reason)
+
+          :throw, value ->
+            exit({{:nocatch, value}, __STACKTRACE__})
+        end
+      end)
+
+    mref = Process.monitor(pid)
+    send(pid, {owner_ref, mref})
+    %{pid: pid, ref: mref}
   end
 
-  defp shutdown_supervisor(sup) do
-    Supervisor.stop(sup, :normal)
-  catch
-    :exit, _ -> :ok
+  defp shutdown_tasks(tasks) do
+    Enum.each(tasks, fn task ->
+      Process.demonitor(task.ref, [:flush])
+      Process.exit(task.pid, :kill)
+    end)
   end
 
   defp remaining_timeout(:infinity, _elapsed), do: :infinity

@@ -1,8 +1,8 @@
 defmodule Resiliency.Hedged.Runner do
   @moduledoc false
 
-  # Core hedging engine. Fires staggered requests using a temporary
-  # Task.Supervisor, takes the first success, and shuts down the rest.
+  # Core hedging engine. Fires staggered requests using spawn_monitor,
+  # takes the first success, and shuts down the rest.
 
   @type meta :: %{dispatched: pos_integer(), winner_index: non_neg_integer() | nil}
 
@@ -18,23 +18,12 @@ defmodule Resiliency.Hedged.Runner do
 
     deadline = now_fn.(:millisecond) + timeout
 
-    {:ok, sup} = Task.Supervisor.start_link()
-
-    try do
-      run_loop(fun, sup, delay, max_requests, non_fatal, on_hedge, now_fn, deadline)
-    after
-      # Ensure all supervised tasks are terminated
-      for {_, pid, _, _} <- Supervisor.which_children(sup) do
-        Task.Supervisor.terminate_child(sup, pid)
-      end
-
-      Supervisor.stop(sup, :normal)
-    end
+    run_loop(fun, delay, max_requests, non_fatal, on_hedge, now_fn, deadline)
   end
 
-  defp run_loop(fun, sup, delay, max_requests, non_fatal, on_hedge, now_fn, deadline) do
+  defp run_loop(fun, delay, max_requests, non_fatal, on_hedge, now_fn, deadline) do
     # Fire first request
-    task1 = fire(sup, fun)
+    task1 = fire(fun)
     tasks = %{task1.ref => {task1, 0}}
 
     state = %{
@@ -47,7 +36,6 @@ defmodule Resiliency.Hedged.Runner do
       now_fn: now_fn,
       deadline: deadline,
       fun: fun,
-      sup: sup,
       last_error: nil,
       pending: 1
     }
@@ -131,7 +119,7 @@ defmodule Resiliency.Hedged.Runner do
 
   defp fire_hedge(state) do
     if state.on_hedge, do: state.on_hedge.(state.dispatched + 1)
-    task = fire(state.sup, state.fun)
+    task = fire(state.fun)
     index = state.dispatched
 
     state = %{
@@ -144,10 +132,35 @@ defmodule Resiliency.Hedged.Runner do
     receive_loop(state)
   end
 
-  defp fire(sup, fun) do
-    Task.Supervisor.async_nolink(sup, fn ->
-      fun.()
-    end)
+  defp fire(fun) do
+    caller = self()
+    owner_ref = make_ref()
+
+    pid =
+      spawn(fn ->
+        mref =
+          receive do
+            {^owner_ref, mref} -> mref
+          end
+
+        try do
+          result = fun.()
+          send(caller, {mref, result})
+        rescue
+          e ->
+            exit({e, __STACKTRACE__})
+        catch
+          :exit, reason ->
+            exit(reason)
+
+          :throw, value ->
+            exit({{:nocatch, value}, __STACKTRACE__})
+        end
+      end)
+
+    mref = Process.monitor(pid)
+    send(pid, {owner_ref, mref})
+    %{pid: pid, ref: mref}
   end
 
   defp normalize({:ok, value}), do: {:ok, value}
@@ -159,14 +172,14 @@ defmodule Resiliency.Hedged.Runner do
   defp shutdown_others(state, winner_ref) do
     for {ref, {task, _index}} <- state.tasks, ref != winner_ref do
       Process.demonitor(ref, [:flush])
-      Task.Supervisor.terminate_child(state.sup, task.pid)
+      Process.exit(task.pid, :kill)
     end
   end
 
   defp shutdown_all(state) do
     for {ref, {task, _index}} <- state.tasks do
       Process.demonitor(ref, [:flush])
-      Task.Supervisor.terminate_child(state.sup, task.pid)
+      Process.exit(task.pid, :kill)
     end
   end
 end

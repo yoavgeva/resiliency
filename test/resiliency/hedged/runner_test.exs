@@ -602,6 +602,58 @@ defmodule Resiliency.Hedged.RunnerTest do
     end
   end
 
+  describe "process cleanup" do
+    test "hedged tasks are cleaned up after winner" do
+      parent = self()
+      ref = :atomics.new(1, signed: false)
+
+      fun = fn ->
+        n = :atomics.add_get(ref, 1, 1)
+
+        if n == 1 do
+          send(parent, {:task_pid, self()})
+          Process.sleep(5_000)
+          {:ok, :slow}
+        else
+          {:ok, :fast}
+        end
+      end
+
+      assert {:ok, :fast, _} = Runner.execute(fun, opts(delay: 10))
+
+      assert_receive {:task_pid, slow_pid}
+      Process.sleep(50)
+      refute Process.alive?(slow_pid)
+    end
+
+    test "all tasks cleaned up after timeout" do
+      parent = self()
+
+      fun = fn ->
+        send(parent, {:task_pid, self()})
+        Process.sleep(10_000)
+        {:ok, :never}
+      end
+
+      Runner.execute(fun, opts(timeout: 50, delay: 10, max_requests: 3))
+
+      # Collect all task pids that were spawned
+      pids = collect_task_pids([])
+      assert pids != []
+
+      Process.sleep(100)
+      Enum.each(pids, fn pid -> refute Process.alive?(pid) end)
+    end
+  end
+
+  defp collect_task_pids(acc) do
+    receive do
+      {:task_pid, pid} -> collect_task_pids([pid | acc])
+    after
+      0 -> acc
+    end
+  end
+
   describe "now_fn injection" do
     test "uses injectable clock for deadline calculation" do
       clock = :atomics.new(1, signed: true)

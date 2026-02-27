@@ -375,6 +375,78 @@ defmodule Resiliency.BackoffRetryTest do
 
       assert :counters.get(counter, 1) == 4
     end
+
+    test "reraise: true re-exits when retries exhausted on exit()" do
+      reason =
+        try do
+          Resiliency.BackoffRetry.retry(fn -> exit(:boom) end,
+            sleep_fn: no_sleep(),
+            max_attempts: 2,
+            reraise: true
+          )
+        catch
+          :exit, reason -> reason
+        end
+
+      assert reason == :boom
+    end
+
+    test "reraise: true re-throws when retries exhausted on throw()" do
+      value =
+        try do
+          Resiliency.BackoffRetry.retry(fn -> throw(:yeet) end,
+            sleep_fn: no_sleep(),
+            max_attempts: 2,
+            reraise: true
+          )
+        catch
+          :throw, value -> value
+        end
+
+      assert value == :yeet
+    end
+
+    test "reraise: true re-exits after multiple retries" do
+      counter = :counters.new(1, [:atomics])
+
+      reason =
+        try do
+          Resiliency.BackoffRetry.retry(
+            fn ->
+              :counters.add(counter, 1, 1)
+              exit(:boom)
+            end,
+            sleep_fn: no_sleep(),
+            max_attempts: 3,
+            reraise: true
+          )
+        catch
+          :exit, reason -> reason
+        end
+
+      assert reason == :boom
+      assert :counters.get(counter, 1) == 3
+    end
+
+    test "reraise: false (default) returns {:error, {:exit, reason}} for exit" do
+      result =
+        Resiliency.BackoffRetry.retry(fn -> exit(:boom) end,
+          sleep_fn: no_sleep(),
+          max_attempts: 1
+        )
+
+      assert result == {:error, {:exit, :boom}}
+    end
+
+    test "reraise: false (default) returns {:error, {:throw, value}} for throw" do
+      result =
+        Resiliency.BackoffRetry.retry(fn -> throw(:yeet) end,
+          sleep_fn: no_sleep(),
+          max_attempts: 1
+        )
+
+      assert result == {:error, {:throw, :yeet}}
+    end
   end
 
   describe "budget" do

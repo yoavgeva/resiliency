@@ -41,6 +41,7 @@ defmodule Resiliency.WeightedSemaphore.Server do
     end
   end
 
+  @impl true
   def handle_call({:try_acquire, weight, fun}, from, state) do
     cond do
       weight < 1 ->
@@ -79,6 +80,7 @@ defmodule Resiliency.WeightedSemaphore.Server do
     end
   end
 
+  @impl true
   def handle_info(_msg, state) do
     {:noreply, state}
   end
@@ -97,13 +99,32 @@ defmodule Resiliency.WeightedSemaphore.Server do
 
   defp notify_waiters(state) do
     case :queue.peek(state.waiters) do
+      {:value, {{pid, _tag}, _weight, _fun}} when is_pid(pid) ->
+        if Process.alive?(pid) do
+          dispatch_front_waiter(state)
+        else
+          # Caller timed out or died — skip this zombie waiter
+          {_popped, rest} = :queue.out(state.waiters)
+          notify_waiters(%{state | waiters: rest})
+        end
+
+      {:value, _} ->
+        dispatch_front_waiter(state)
+
+      :empty ->
+        state
+    end
+  end
+
+  defp dispatch_front_waiter(state) do
+    case :queue.peek(state.waiters) do
       {:value, {_from, weight, _fun}} when state.current + weight <= state.max ->
         {{:value, {from, weight, fun}}, rest} = :queue.out(state.waiters)
         state = %{state | waiters: rest}
         state = spawn_task(from, weight, fun, state)
         notify_waiters(state)
 
-      # Either empty queue or next waiter doesn't fit — stop (FIFO fairness)
+      # Next waiter doesn't fit — stop (FIFO fairness)
       _ ->
         state
     end

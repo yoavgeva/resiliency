@@ -8,6 +8,50 @@ defmodule Resiliency.SingleFlight do
 
   Inspired by Go's `singleflight` package.
 
+  ## When to use
+
+    * Loading a popular cache key that just expired — without deduplication,
+      hundreds of processes may simultaneously query the database for the same
+      row ("cache stampede" / "thundering herd"). SingleFlight ensures only
+      one query runs while the rest wait.
+    * Fetching a remote configuration blob or feature-flag payload that many
+      GenServers request at startup — deduplication avoids redundant network
+      calls.
+    * Resolving a DNS name or refreshing an OAuth token that several
+      concurrent HTTP clients need at the same moment.
+    * Any expensive or rate-limited operation keyed by a string, where
+      concurrent callers can safely share a single result.
+
+  ## How it works
+
+  `Resiliency.SingleFlight` is backed by a GenServer that maintains a map of
+  in-flight keys. When `flight/3` is called, the server checks whether the
+  given key already has a running execution. If not, a new process is spawned
+  to run the user function, and the caller's `from` reference is stored as
+  the first waiter. If the key is already in-flight, the caller's `from` is
+  appended to the existing waiter list — no new process is spawned.
+
+  When the spawned process completes (successfully, or via raise/exit/throw),
+  the server receives the result, replies to every waiting caller with the
+  same value, and removes the key from the in-flight map. This means the cost
+  of the underlying function is paid exactly once per key per flight window,
+  regardless of how many processes called `flight/3` concurrently.
+
+  `forget/2` removes a key from the in-flight map without cancelling the
+  running execution. Existing waiters still receive the original result, but
+  any new caller after `forget/2` triggers a fresh execution — useful for
+  forcing a reload after a write.
+
+  ## Algorithm Complexity
+
+  | Function | Time | Space |
+  |---|---|---|
+  | `start_link/1` | O(1) | O(1) |
+  | `child_spec/1` | O(1) | O(1) |
+  | `flight/3` | O(1) amortized — map lookup + optional spawn | O(w) where w = number of waiters for this key |
+  | `flight/4` | O(1) amortized — same as `flight/3` with a timeout | O(w) |
+  | `forget/2` | O(1) — map delete | O(1) |
+
   ## Usage
 
       # Add to your supervision tree
@@ -29,9 +73,18 @@ defmodule Resiliency.SingleFlight do
   @doc """
   Returns a child spec for starting a `Resiliency.SingleFlight` server.
 
-  ## Options
+  ## Parameters
 
-    * `:name` - (required) the name to register the server under
+  * `opts` -- keyword list of options.
+    * `:name` -- (required) the name to register the server under.
+
+  ## Returns
+
+  A `Supervisor.child_spec()` map suitable for inclusion in a supervision tree.
+
+  ## Raises
+
+  Raises `KeyError` if the required `:name` option is not provided.
 
   ## Examples
 
@@ -54,10 +107,18 @@ defmodule Resiliency.SingleFlight do
   @doc """
   Starts a `Resiliency.SingleFlight` server.
 
-  ## Options
+  ## Parameters
 
-    * `:name` - (required) the name to register the server under
+  * `opts` -- keyword list of options.
+    * `:name` -- (required) the name to register the server under.
 
+  ## Returns
+
+  `{:ok, pid}` on success, or `{:error, reason}` if the process cannot be started.
+
+  ## Raises
+
+  Raises `KeyError` if the required `:name` option is not provided.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -74,6 +135,16 @@ defmodule Resiliency.SingleFlight do
 
   Returns `{:ok, result}` on success or `{:error, reason}` if the
   function raises, throws, or exits.
+
+  ## Parameters
+
+  * `server` -- the name or PID of a running `Resiliency.SingleFlight` server.
+  * `key` -- any term used to deduplicate concurrent calls.
+  * `fun` -- a zero-arity function to execute.
+
+  ## Returns
+
+  `{:ok, result}` on success, or `{:error, reason}` if the function raises, throws, or exits.
 
   ## Examples
 
@@ -100,6 +171,17 @@ defmodule Resiliency.SingleFlight do
   process exits with `{:timeout, _}`. The in-flight function continues
   executing and will still deliver results to other waiting callers.
 
+  ## Parameters
+
+  * `server` -- the name or PID of a running `Resiliency.SingleFlight` server.
+  * `key` -- any term used to deduplicate concurrent calls.
+  * `fun` -- a zero-arity function to execute.
+  * `timeout` -- caller-side timeout in milliseconds.
+
+  ## Returns
+
+  `{:ok, result}` on success, or `{:error, reason}` if the function raises, throws, or exits. Exits with `{:timeout, _}` if the timeout expires before the function completes.
+
   ## Examples
 
       Resiliency.SingleFlight.flight(MyApp.Flights, "slow-key", fn ->
@@ -120,6 +202,15 @@ defmodule Resiliency.SingleFlight do
   If there is an in-flight call for the key, existing waiters still receive
   the original result. Only new callers after `forget/2` will trigger a
   fresh execution.
+
+  ## Parameters
+
+  * `server` -- the name or PID of a running `Resiliency.SingleFlight` server.
+  * `key` -- the key to forget.
+
+  ## Returns
+
+  `:ok`. The forget is processed asynchronously via `GenServer.cast/2`.
 
   ## Examples
 

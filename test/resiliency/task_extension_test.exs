@@ -545,4 +545,86 @@ defmodule Resiliency.TaskExtensionTest do
       refute_received :should_not_run
     end
   end
+
+  describe "process cleanup" do
+    test "race cleans up cancelled tasks" do
+      parent = self()
+
+      Resiliency.TaskExtension.race([
+        fn ->
+          send(parent, {:pid, self()})
+          Process.sleep(5_000)
+          :slow
+        end,
+        fn -> :fast end
+      ])
+
+      assert_receive {:pid, slow_pid}
+      Process.sleep(50)
+      refute Process.alive?(slow_pid)
+    end
+
+    test "all_settled cleans up after completion" do
+      parent = self()
+
+      Resiliency.TaskExtension.all_settled([
+        fn ->
+          send(parent, {:pid, self()})
+          1
+        end,
+        fn -> raise "boom" end,
+        fn -> 3 end
+      ])
+
+      assert_receive {:pid, pid}
+      Process.sleep(50)
+      refute Process.alive?(pid)
+    end
+
+    test "map cleans up after error" do
+      parent = self()
+
+      Resiliency.TaskExtension.map(
+        1..5,
+        fn
+          3 ->
+            raise "boom"
+
+          x ->
+            send(parent, {:pid, self()})
+            Process.sleep(5_000)
+            x
+        end,
+        max_concurrency: 5
+      )
+
+      # Collect tracked pids
+      pids = collect_pids([])
+      assert pids != []
+
+      Process.sleep(100)
+      Enum.each(pids, fn pid -> refute Process.alive?(pid) end)
+    end
+
+    test "race task crashes do not leak monitors" do
+      # Run many races with crashing tasks to check for monitor leaks
+      for _ <- 1..50 do
+        Resiliency.TaskExtension.race([
+          fn -> raise "boom" end,
+          fn -> :ok end
+        ])
+      end
+
+      # If monitors leaked, the process mailbox would have stale :DOWN messages
+      refute_receive {:DOWN, _, _, _, _}, 0
+    end
+  end
+
+  defp collect_pids(acc) do
+    receive do
+      {:pid, pid} -> collect_pids([pid | acc])
+    after
+      0 -> acc
+    end
+  end
 end

@@ -3,7 +3,7 @@ defmodule Resiliency.SingleFlight.Server do
 
   use GenServer
 
-  defstruct calls: %{}
+  defstruct calls: %{}, ref_to_key: %{}, task_supervisor: nil
 
   @doc false
   def start_link(opts) do
@@ -12,7 +12,8 @@ defmodule Resiliency.SingleFlight.Server do
 
   @impl true
   def init(:ok) do
-    {:ok, %__MODULE__{}}
+    {:ok, task_supervisor} = Task.Supervisor.start_link()
+    {:ok, %__MODULE__{task_supervisor: task_supervisor}}
   end
 
   @impl true
@@ -25,10 +26,17 @@ defmodule Resiliency.SingleFlight.Server do
 
       :error ->
         # Key not in-flight — spawn task and track it
-        task = Task.async(fn -> execute(fun) end)
+        task = Task.Supervisor.async_nolink(state.task_supervisor, fn -> execute(fun) end)
 
         entry = %{callers: [from], task_ref: task.ref, task_pid: task.pid}
-        {:noreply, put_in(state.calls[key], entry)}
+
+        state = %{
+          state
+          | calls: Map.put(state.calls, key, entry),
+            ref_to_key: Map.put(state.ref_to_key, task.ref, key)
+        }
+
+        {:noreply, state}
     end
   end
 
@@ -38,9 +46,15 @@ defmodule Resiliency.SingleFlight.Server do
       {:ok, entry} ->
         # Move existing entry to a ref-only tracking so in-flight waiters
         # still get their result, but new callers with this key start fresh
-        forgotten = Map.delete(state.calls, key)
         ref_key = {:ref, entry.task_ref}
-        {:noreply, %{state | calls: Map.put(forgotten, ref_key, entry)}}
+
+        state = %{
+          state
+          | calls: state.calls |> Map.delete(key) |> Map.put(ref_key, entry),
+            ref_to_key: Map.put(state.ref_to_key, entry.task_ref, ref_key)
+        }
+
+        {:noreply, state}
 
       :error ->
         {:noreply, state}
@@ -52,24 +66,40 @@ defmodule Resiliency.SingleFlight.Server do
     # Task completed successfully — flush the :DOWN message
     Process.demonitor(ref, [:flush])
 
-    case find_entry_by_ref(state.calls, ref) do
-      {key, entry} ->
+    case Map.fetch(state.ref_to_key, ref) do
+      {:ok, key} ->
+        entry = Map.fetch!(state.calls, key)
         reply_to_all(entry.callers, result)
-        {:noreply, %{state | calls: Map.delete(state.calls, key)}}
 
-      nil ->
+        state = %{
+          state
+          | calls: Map.delete(state.calls, key),
+            ref_to_key: Map.delete(state.ref_to_key, ref)
+        }
+
+        {:noreply, state}
+
+      :error ->
         {:noreply, state}
     end
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     # Task crashed
-    case find_entry_by_ref(state.calls, ref) do
-      {key, entry} ->
+    case Map.fetch(state.ref_to_key, ref) do
+      {:ok, key} ->
+        entry = Map.fetch!(state.calls, key)
         reply_to_all(entry.callers, {:error, reason})
-        {:noreply, %{state | calls: Map.delete(state.calls, key)}}
 
-      nil ->
+        state = %{
+          state
+          | calls: Map.delete(state.calls, key),
+            ref_to_key: Map.delete(state.ref_to_key, ref)
+        }
+
+        {:noreply, state}
+
+      :error ->
         {:noreply, state}
     end
   end
@@ -84,13 +114,6 @@ defmodule Resiliency.SingleFlight.Server do
     e -> {:error, {e, __STACKTRACE__}}
   catch
     kind, reason -> {:error, {kind, reason}}
-  end
-
-  defp find_entry_by_ref(calls, ref) do
-    Enum.find_value(calls, fn
-      {key, %{task_ref: ^ref} = entry} -> {key, entry}
-      _ -> nil
-    end)
   end
 
   defp reply_to_all(callers, result) do
