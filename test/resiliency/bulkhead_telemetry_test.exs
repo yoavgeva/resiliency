@@ -176,23 +176,13 @@ defmodule Resiliency.BulkheadTelemetryTest do
       Resiliency.Bulkhead.call(bh, fn -> :never end)
 
       # Consume the filler task's events
-      assert_received {:telemetry, [:resiliency, :bulkhead, :call, :start], _, _}
-      assert_received {:telemetry, [:resiliency, :bulkhead, :call, :permitted], _, _}
+      assert_received {:telemetry, [:resiliency, :bulkhead, :call, :start], _, %{name: ^bh}}
+      assert_received {:telemetry, [:resiliency, :bulkhead, :call, :permitted], _, %{name: ^bh}}
 
       # Rejected call events
-      assert_received {:telemetry, [:resiliency, :bulkhead, :call, :start], _,
-                       %{name: received_name}}
-
-      assert received_name == bh
-
-      assert_received {:telemetry, [:resiliency, :bulkhead, :call, :rejected], _,
-                       %{name: rejected_name}}
-
-      assert rejected_name == bh
-
-      assert_received {:telemetry, [:resiliency, :bulkhead, :call, :stop], _, %{name: stop_name}}
-
-      assert stop_name == bh
+      assert_received {:telemetry, [:resiliency, :bulkhead, :call, :start], _, %{name: ^bh}}
+      assert_received {:telemetry, [:resiliency, :bulkhead, :call, :rejected], _, %{name: ^bh}}
+      assert_received {:telemetry, [:resiliency, :bulkhead, :call, :stop], _, %{name: ^bh}}
 
       gate_open(gate)
       Task.await(task)
