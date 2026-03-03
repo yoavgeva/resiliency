@@ -120,6 +120,34 @@ Key traits:
 
 ---
 
+### "I need to isolate workloads with per-partition concurrency limits"
+
+Use **`Resiliency.Bulkhead`** -- named concurrency limiter that isolates
+workloads into separate partitions with rejection semantics.
+
+```elixir
+children = [{Resiliency.Bulkhead, name: MyApp.PaymentBulkhead, max_concurrent: 10}]
+Supervisor.start_link(children, strategy: :one_for_one)
+
+case Resiliency.Bulkhead.call(MyApp.PaymentBulkhead, fn ->
+  PaymentGateway.charge(amount)
+end) do
+  {:ok, result} -> result
+  {:error, :bulkhead_full} -> {:error, :overloaded}
+  {:error, reason} -> {:error, reason}
+end
+```
+
+Key traits:
+
+- Runs the function in the **caller's process** -- the GenServer is never blocked.
+- Server-managed wait queue with configurable `max_wait` and FIFO fairness.
+- Immediate rejection when full (`max_wait: 0`) or queued waiting (`max_wait: N`).
+- Per-call `max_wait` overrides.
+- Stateful -- requires a `GenServer`.
+
+---
+
 ### "I need to limit concurrent access to a resource"
 
 Use **`Resiliency.WeightedSemaphore`** -- bound concurrency with per-operation
@@ -206,6 +234,7 @@ Key traits:
 | `BackoffRetry` | Transient failures | Yes -- backoff delays between attempts | No -- sequential attempts | No | HTTP calls, database queries, anything with intermittent errors |
 | `Hedged` | Tail latency | No -- reduces p99 | Yes -- fires extra requests | Adaptive: yes; Stateless: no | Latency-sensitive RPCs, fan-out queries, cache lookups |
 | `SingleFlight` | Thundering herd / duplicate work | No -- late arrivals skip the I/O and share the result | No -- reduces load by deduplication | Yes | Cache population, config reloads, expensive computations with shared keys |
+| `Bulkhead` | Workload isolation | When waiting -- callers queue or reject | No -- caps it | Yes | Per-service concurrency limits, workload isolation, load shedding |
 | `WeightedSemaphore` | Unbounded concurrency | When saturated -- callers queue | No -- caps it | Yes | Database pools, API rate limits, disk I/O, GPU access |
 | `Race` | Need the fastest result from N sources | No -- returns the first success | Yes -- runs all concurrently | No | Multi-region fetch, redundant providers |
 | `Map` | Parallel processing with a concurrency cap | No (unless saturated) | Bounded by `max_concurrency` | No | Bulk HTTP fetches, batch processing |
@@ -342,6 +371,18 @@ end)
 ---
 
 ## Parameter Quick-Reference
+
+### `Resiliency.Bulkhead`
+
+| Option | Type | Default | Recommendation |
+|---|---|---|---|
+| `:name` | atom or `{:via, ...}` | required | One bulkhead per downstream service or workload |
+| `:max_concurrent` | non-negative integer | required | Set to the downstream's actual concurrency limit; `0` rejects all calls (kill-switch) |
+| `:max_wait` | ms, `0`, or `:infinity` | `0` | `0` for fail-fast; set a timeout for queue-based load leveling |
+| `:on_call_permitted` | `fn name -> any` or `nil` | `nil` | Use for telemetry -- track permitted calls |
+| `:on_call_rejected` | `fn name -> any` or `nil` | `nil` | Use for telemetry -- track rejected calls |
+| `:on_call_finished` | `fn name -> any` or `nil` | `nil` | Use for telemetry -- track completed calls |
+| `max_wait` (per-call) | ms, `0`, or `:infinity` | server default | Override the server default for specific calls |
 
 ### `Resiliency.CircuitBreaker`
 

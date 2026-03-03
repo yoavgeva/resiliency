@@ -1,7 +1,7 @@
 defmodule Resiliency.MixProject do
   use Mix.Project
 
-  @version "0.3.1"
+  @version "0.5.0"
   @source_url "https://github.com/yoavgeva/resiliency"
 
   def project do
@@ -16,7 +16,7 @@ defmodule Resiliency.MixProject do
       dialyzer: [plt_add_apps: [:ex_unit]],
       name: "Resiliency",
       description:
-        "Resilience and concurrency toolkit for Elixir — circuit breaker, retry, hedged requests, single-flight, task combinators, and weighted semaphore."
+        "Resilience and concurrency toolkit for Elixir — bulkhead, circuit breaker, retry, hedged requests, single-flight, task combinators, and weighted semaphore."
     ]
   end
 
@@ -26,6 +26,7 @@ defmodule Resiliency.MixProject do
 
   defp deps do
     [
+      {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
@@ -67,6 +68,7 @@ defmodule Resiliency.MixProject do
         ]
       ],
       groups_for_modules: [
+        Telemetry: [Resiliency.Telemetry],
         Retry: [Resiliency.BackoffRetry, Resiliency.BackoffRetry.Backoff],
         "Hedged Requests": [
           Resiliency.Hedged,
@@ -81,7 +83,8 @@ defmodule Resiliency.MixProject do
           Resiliency.FirstOk
         ],
         Semaphore: [Resiliency.WeightedSemaphore],
-        "Circuit Breaker": [Resiliency.CircuitBreaker]
+        "Circuit Breaker": [Resiliency.CircuitBreaker],
+        Bulkhead: [Resiliency.Bulkhead]
       ]
     ]
   end

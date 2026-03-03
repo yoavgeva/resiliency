@@ -96,6 +96,88 @@ defmodule Resiliency.CircuitBreaker do
   | `reset/1` | O(w) — reallocates window | O(w) |
   | `force_open/1` | O(1) | O(1) |
   | `force_close/1` | O(w) — resets window | O(w) |
+
+  ## Telemetry
+
+  Call events are emitted in the **caller's process**. The `state_change` event is emitted
+  inside the **GenServer process** (state transitions happen asynchronously in `handle_cast`
+  / `handle_info` callbacks). See `Resiliency.Telemetry` for the complete event catalogue.
+
+  ### `[:resiliency, :circuit_breaker, :call, :start]`
+
+  Emitted at the beginning of every `call/2,3` invocation, before the permission check.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `system_time` | `integer` | `System.system_time()` at emission time |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `name` | `term` | The circuit breaker name passed to `call/2,3` |
+
+  ### `[:resiliency, :circuit_breaker, :call, :rejected]`
+
+  Emitted when the circuit is open and the call is rejected without executing the function.
+  Always followed immediately by a `:stop` event.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | _(none)_ | | |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `name` | `term` | The circuit breaker name |
+
+  ### `[:resiliency, :circuit_breaker, :call, :stop]`
+
+  Emitted after every `call/2,3` completes — whether permitted, rejected, successful, or failed.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units (`System.monotonic_time/0` delta) |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `name` | `term` | The circuit breaker name |
+  | `result` | `:ok \| :error` | `:ok` on success, `:error` on failure or rejection |
+  | `error` | `term \| nil` | The error reason, `:circuit_open` if rejected, `nil` on success |
+
+  ### `[:resiliency, :circuit_breaker, :state_change]`
+
+  Emitted inside the GenServer process when the circuit transitions between states.
+
+  > #### GenServer process {: .warning}
+  >
+  > This event is emitted from within the circuit breaker GenServer, not the caller's process.
+  > Slow telemetry handlers attached to this event will block the GenServer's message loop.
+  > Keep handlers fast.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | _(none)_ | | |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `name` | `term` | The circuit breaker name |
+  | `from` | `:closed \| :open \| :half_open` | Previous state |
+  | `to` | `:closed \| :open \| :half_open` | New state |
+
   """
 
   @typedoc "A circuit breaker reference — a registered name, PID, or `{:via, ...}` tuple."
@@ -186,8 +268,31 @@ defmodule Resiliency.CircuitBreaker do
   @spec call(name(), (-> result), keyword()) :: {:ok, result} | {:error, term()}
         when result: term()
   def call(name, fun, _opts \\ []) when is_function(fun, 0) do
+    telemetry_start_time = System.monotonic_time()
+    system_time = System.system_time()
+
+    :telemetry.execute(
+      [:resiliency, :circuit_breaker, :call, :start],
+      %{system_time: system_time},
+      %{name: name}
+    )
+
     case GenServer.call(name, :check_permission) do
       {:error, :circuit_open} ->
+        duration = System.monotonic_time() - telemetry_start_time
+
+        :telemetry.execute(
+          [:resiliency, :circuit_breaker, :call, :rejected],
+          %{},
+          %{name: name}
+        )
+
+        :telemetry.execute(
+          [:resiliency, :circuit_breaker, :call, :stop],
+          %{duration: duration},
+          %{name: name, result: :error, error: :circuit_open}
+        )
+
         {:error, :circuit_open}
 
       {:ok, should_record} ->
@@ -206,9 +311,26 @@ defmodule Resiliency.CircuitBreaker do
             GenServer.cast(name, {:record, outcome, duration_ms})
         end
 
+        duration = System.monotonic_time() - telemetry_start_time
+
         case error_result do
-          nil -> {:ok, raw_result}
-          err -> {:error, err}
+          nil ->
+            :telemetry.execute(
+              [:resiliency, :circuit_breaker, :call, :stop],
+              %{duration: duration},
+              %{name: name, result: :ok, error: nil}
+            )
+
+            {:ok, raw_result}
+
+          err ->
+            :telemetry.execute(
+              [:resiliency, :circuit_breaker, :call, :stop],
+              %{duration: duration},
+              %{name: name, result: :error, error: err}
+            )
+
+            {:error, err}
         end
     end
   end

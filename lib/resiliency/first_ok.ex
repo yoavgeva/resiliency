@@ -47,6 +47,64 @@ defmodule Resiliency.FirstOk do
         fn -> fetch_from_api(key) end
       ])
 
+  ## Telemetry
+
+  All events are emitted in the caller's process via `:telemetry.span/3`. See
+  `Resiliency.Telemetry` for the complete event catalogue.
+
+  ### `[:resiliency, :first_ok, :run, :start]`
+
+  Emitted before any task is attempted.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `system_time` | `integer` | `System.system_time()` at emission time |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `count` | `integer` | Number of functions submitted |
+
+  ### `[:resiliency, :first_ok, :run, :stop]`
+
+  Emitted after the first success, or after all functions have been tried.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units (`System.monotonic_time/0` delta) |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `count` | `integer` | Total number of functions |
+  | `result` | `:ok \| :error` | `:ok` if any function succeeded, `:error` if all failed |
+  | `attempts` | `integer` | Number of functions actually tried before stopping |
+
+  ### `[:resiliency, :first_ok, :run, :exception]`
+
+  Emitted if `run/2` raises or exits unexpectedly.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `count` | `integer` | Number of functions submitted |
+  | `kind` | `atom` | Exception kind (`:error`, `:exit`, or `:throw`) |
+  | `reason` | `term` | The exception or exit reason |
+  | `stacktrace` | `list` | Stack at the point of the exception |
+
   """
 
   @type task_fun :: (-> any())
@@ -100,25 +158,38 @@ defmodule Resiliency.FirstOk do
   def run([], _opts), do: {:error, :empty}
 
   def run(funs, opts) do
-    timeout = Keyword.get(opts, :timeout, :infinity)
-    do_first_ok(funs, timeout)
+    count = length(funs)
+    meta = %{count: count}
+
+    :telemetry.span([:resiliency, :first_ok, :run], meta, fn ->
+      timeout = Keyword.get(opts, :timeout, :infinity)
+      {result, attempts} = do_first_ok(funs, timeout, 0)
+
+      result_key =
+        case result do
+          {:ok, _} -> :ok
+          {:error, _} -> :error
+        end
+
+      {result, %{count: count, result: result_key, attempts: attempts}}
+    end)
   end
 
-  defp do_first_ok([], _timeout), do: {:error, :all_failed}
+  defp do_first_ok([], _timeout, attempts), do: {{:error, :all_failed}, attempts}
 
-  defp do_first_ok([fun | rest], timeout) do
+  defp do_first_ok([fun | rest], timeout, attempts) do
     start = System.monotonic_time(:millisecond)
 
     case try_fun(fun) do
       {:ok, _} = ok_result ->
-        ok_result
+        {ok_result, attempts + 1}
 
       :failed ->
         new_timeout = subtract_elapsed(timeout, start)
 
         if timed_out?(new_timeout),
-          do: {:error, :all_failed},
-          else: do_first_ok(rest, new_timeout)
+          do: {{:error, :all_failed}, attempts + 1},
+          else: do_first_ok(rest, new_timeout, attempts + 1)
     end
   end
 

@@ -57,6 +57,63 @@ defmodule Resiliency.Race do
         fn -> fetch_from_another_service() end
       ], timeout: 5_000)
 
+  ## Telemetry
+
+  All events are emitted in the caller's process via `:telemetry.span/3`. See
+  `Resiliency.Telemetry` for the complete event catalogue.
+
+  ### `[:resiliency, :race, :run, :start]`
+
+  Emitted before tasks are spawned.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `system_time` | `integer` | `System.system_time()` at emission time |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `count` | `integer` | Number of functions in the race |
+
+  ### `[:resiliency, :race, :run, :stop]`
+
+  Emitted after the first result is received.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units (`System.monotonic_time/0` delta) |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `count` | `integer` | Number of functions in the race |
+  | `result` | `:ok \| :error` | Outcome of the winning result |
+
+  ### `[:resiliency, :race, :run, :exception]`
+
+  Emitted if `run/2` raises or exits (e.g., an unexpected error in the collection logic).
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `count` | `integer` | Number of functions in the race |
+  | `kind` | `atom` | Exception kind (`:error`, `:exit`, or `:throw`) |
+  | `reason` | `term` | The exception or exit reason |
+  | `stacktrace` | `list` | Stack at the point of the exception |
+
   """
 
   import Resiliency.TaskHelper,
@@ -112,11 +169,22 @@ defmodule Resiliency.Race do
   def run([], _opts), do: {:error, :empty}
 
   def run(funs, opts) do
-    timeout = Keyword.get(opts, :timeout, :infinity)
+    meta = %{count: length(funs)}
 
-    tasks = Enum.map(funs, &spawn_task/1)
-    task_set = Map.new(tasks, fn task -> {task.ref, task} end)
-    do_race(task_set, map_size(task_set), timeout)
+    :telemetry.span([:resiliency, :race, :run], meta, fn ->
+      timeout = Keyword.get(opts, :timeout, :infinity)
+      tasks = Enum.map(funs, &spawn_task/1)
+      task_set = Map.new(tasks, fn task -> {task.ref, task} end)
+      result = do_race(task_set, map_size(task_set), timeout)
+
+      result_key =
+        case result do
+          {:ok, _} -> :ok
+          {:error, _} -> :error
+        end
+
+      {result, %{count: meta.count, result: result_key}}
+    end)
   end
 
   defp do_race(_task_set, 0, _timeout), do: {:error, :all_failed}

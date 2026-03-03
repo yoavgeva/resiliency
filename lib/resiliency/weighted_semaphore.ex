@@ -92,6 +92,69 @@ defmodule Resiliency.WeightedSemaphore do
   | `acquire/3,4` | O(1) GenServer call + O(q) queue drain on release | O(q) |
   | `try_acquire/2` | O(1) — immediate accept or reject, no queue interaction | O(1) |
   | `try_acquire/3` | O(1) | O(1) |
+
+  ## Telemetry
+
+  All events are emitted in the caller's process. Both `acquire/2,3,4` and `try_acquire/2,3`
+  share the same event names. See `Resiliency.Telemetry` for the complete event catalogue.
+
+  ### `[:resiliency, :semaphore, :acquire, :start]`
+
+  Emitted at the beginning of every `acquire` or `try_acquire` call.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `system_time` | `integer` | `System.system_time()` at emission time |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `name` | `term` | The semaphore name |
+  | `weight` | `integer` | The weight requested |
+
+  ### `[:resiliency, :semaphore, :acquire, :rejected]`
+
+  Emitted when an acquire attempt is rejected without waiting. Always followed immediately
+  by a `:stop` event.
+
+  Emitted by:
+  - `try_acquire` when the semaphore is full (`:rejected`)
+  - `acquire` or `try_acquire` when `weight > max` (`:weight_exceeds_max`)
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | _(none)_ | | |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `name` | `term` | The semaphore name |
+  | `weight` | `integer` | The weight requested |
+
+  ### `[:resiliency, :semaphore, :acquire, :stop]`
+
+  Emitted after every acquire or try_acquire call completes.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units (`System.monotonic_time/0` delta) |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `name` | `term` | The semaphore name |
+  | `weight` | `integer` | The weight requested |
+  | `result` | `:ok \| :error \| :rejected` | `:ok` on success; `:rejected` when `try_acquire` finds the semaphore full; `:error` on timeout, weight_exceeds_max, or other error |
+
   """
 
   @typedoc "A semaphore reference — a registered name, PID, or `{:via, ...}` tuple."
@@ -234,9 +297,72 @@ defmodule Resiliency.WeightedSemaphore do
         when result: term()
   def acquire(sem, weight, fun, timeout \\ :infinity)
       when is_integer(weight) and is_function(fun, 0) do
-    GenServer.call(sem, {:acquire, weight, fun}, timeout)
-  catch
-    :exit, {:timeout, _} -> {:error, :timeout}
+    start_time = System.monotonic_time()
+    meta = %{name: sem, weight: weight}
+
+    :telemetry.execute(
+      [:resiliency, :semaphore, :acquire, :start],
+      %{system_time: System.system_time()},
+      meta
+    )
+
+    try do
+      result = GenServer.call(sem, {:acquire, weight, fun}, timeout)
+      duration = System.monotonic_time() - start_time
+
+      case result do
+        {:ok, _value} ->
+          :telemetry.execute(
+            [:resiliency, :semaphore, :acquire, :stop],
+            %{duration: duration},
+            %{name: sem, weight: weight, result: :ok}
+          )
+
+        {:error, :weight_exceeds_max} ->
+          :telemetry.execute(
+            [:resiliency, :semaphore, :acquire, :rejected],
+            %{},
+            meta
+          )
+
+          :telemetry.execute(
+            [:resiliency, :semaphore, :acquire, :stop],
+            %{duration: duration},
+            %{name: sem, weight: weight, result: :error}
+          )
+
+        {:error, _reason} ->
+          :telemetry.execute(
+            [:resiliency, :semaphore, :acquire, :stop],
+            %{duration: duration},
+            %{name: sem, weight: weight, result: :error}
+          )
+      end
+
+      result
+    catch
+      :exit, {:timeout, _} ->
+        duration = System.monotonic_time() - start_time
+
+        :telemetry.execute(
+          [:resiliency, :semaphore, :acquire, :stop],
+          %{duration: duration},
+          %{name: sem, weight: weight, result: :error}
+        )
+
+        {:error, :timeout}
+
+      :exit, reason ->
+        duration = System.monotonic_time() - start_time
+
+        :telemetry.execute(
+          [:resiliency, :semaphore, :acquire, :stop],
+          %{duration: duration},
+          %{name: sem, weight: weight, result: :error}
+        )
+
+        exit(reason)
+    end
   end
 
   @doc """
@@ -305,6 +431,73 @@ defmodule Resiliency.WeightedSemaphore do
         when result: term()
   def try_acquire(sem, weight, fun)
       when is_integer(weight) and is_function(fun, 0) do
-    GenServer.call(sem, {:try_acquire, weight, fun})
+    start_time = System.monotonic_time()
+    meta = %{name: sem, weight: weight}
+
+    :telemetry.execute(
+      [:resiliency, :semaphore, :acquire, :start],
+      %{system_time: System.system_time()},
+      meta
+    )
+
+    try do
+      result = GenServer.call(sem, {:try_acquire, weight, fun})
+      duration = System.monotonic_time() - start_time
+
+      case result do
+        {:ok, _value} ->
+          :telemetry.execute(
+            [:resiliency, :semaphore, :acquire, :stop],
+            %{duration: duration},
+            %{name: sem, weight: weight, result: :ok}
+          )
+
+        :rejected ->
+          :telemetry.execute(
+            [:resiliency, :semaphore, :acquire, :rejected],
+            %{},
+            meta
+          )
+
+          :telemetry.execute(
+            [:resiliency, :semaphore, :acquire, :stop],
+            %{duration: duration},
+            %{name: sem, weight: weight, result: :rejected}
+          )
+
+        {:error, :weight_exceeds_max} ->
+          :telemetry.execute(
+            [:resiliency, :semaphore, :acquire, :rejected],
+            %{},
+            meta
+          )
+
+          :telemetry.execute(
+            [:resiliency, :semaphore, :acquire, :stop],
+            %{duration: duration},
+            %{name: sem, weight: weight, result: :error}
+          )
+
+        {:error, _reason} ->
+          :telemetry.execute(
+            [:resiliency, :semaphore, :acquire, :stop],
+            %{duration: duration},
+            %{name: sem, weight: weight, result: :error}
+          )
+      end
+
+      result
+    catch
+      :exit, reason ->
+        duration = System.monotonic_time() - start_time
+
+        :telemetry.execute(
+          [:resiliency, :semaphore, :acquire, :stop],
+          %{duration: duration},
+          %{name: sem, weight: weight, result: :error}
+        )
+
+        exit(reason)
+    end
   end
 end

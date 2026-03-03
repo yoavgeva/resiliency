@@ -358,10 +358,16 @@ defmodule Resiliency.CircuitBreaker.Server do
 
   defp fire_state_change(_state, same, same), do: :ok
 
-  defp fire_state_change(%{on_state_change: nil}, _old, _new), do: :ok
-
   defp fire_state_change(state, old_state, new_state) do
-    state.on_state_change.(state.name, old_state, new_state)
+    :telemetry.execute(
+      [:resiliency, :circuit_breaker, :state_change],
+      %{},
+      %{name: state.name, from: old_state, to: new_state}
+    )
+
+    if state.on_state_change do
+      state.on_state_change.(state.name, old_state, new_state)
+    end
   rescue
     _ -> :ok
   catch

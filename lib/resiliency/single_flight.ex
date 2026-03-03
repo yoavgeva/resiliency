@@ -64,6 +64,70 @@ defmodule Resiliency.SingleFlight do
 
       # Evict a key so next call starts fresh
       :ok = Resiliency.SingleFlight.forget(MyApp.Flights, "user:123")
+
+  ## Telemetry
+
+  All events are emitted in the caller's process. See `Resiliency.Telemetry` for the
+  complete event catalogue.
+
+  ### `[:resiliency, :single_flight, :flight, :start]`
+
+  Emitted at the beginning of every `flight/3,4` call, before the deduplication check.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `system_time` | `integer` | `System.system_time()` at emission time |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `name` | `term` | The server name or PID |
+  | `key` | `term` | The deduplication key |
+
+  ### `[:resiliency, :single_flight, :flight, :stop]`
+
+  Emitted after the call completes, whether the caller executed the function or shared
+  another caller's result.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units (`System.monotonic_time/0` delta) |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `name` | `term` | The server name or PID |
+  | `key` | `term` | The deduplication key |
+  | `result` | `:ok \| :error` | `:ok` on success, `:error` if the function failed |
+  | `shared` | `boolean` | `true` if this caller received a result from another in-flight call |
+
+  ### `[:resiliency, :single_flight, :flight, :exception]`
+
+  Emitted instead of `:stop` when the GenServer process exits (e.g., server crash or
+  `flight/4` timeout). The calling process re-exits after this event.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `name` | `term` | The server name or PID |
+  | `key` | `term` | The deduplication key |
+  | `kind` | `:exit` | Always `:exit` |
+  | `reason` | `term` | The exit reason |
+  | `stacktrace` | `list` | Stack at the point of the exit |
+
   """
 
   @type server :: GenServer.server()
@@ -161,7 +225,50 @@ defmodule Resiliency.SingleFlight do
   """
   @spec flight(server(), key(), (-> term())) :: result()
   def flight(server, key, fun) when is_function(fun, 0) do
-    GenServer.call(server, {:flight, key, fun}, :infinity)
+    start_time = System.monotonic_time()
+
+    :telemetry.execute(
+      [:resiliency, :single_flight, :flight, :start],
+      %{system_time: System.system_time()},
+      %{name: server, key: key}
+    )
+
+    try do
+      case GenServer.call(server, {:flight, key, fun}, :infinity) do
+        {:ok, value, shared} ->
+          duration = System.monotonic_time() - start_time
+
+          :telemetry.execute(
+            [:resiliency, :single_flight, :flight, :stop],
+            %{duration: duration},
+            %{name: server, key: key, result: :ok, shared: shared}
+          )
+
+          {:ok, value}
+
+        {:error, reason, shared} ->
+          duration = System.monotonic_time() - start_time
+
+          :telemetry.execute(
+            [:resiliency, :single_flight, :flight, :stop],
+            %{duration: duration},
+            %{name: server, key: key, result: :error, shared: shared}
+          )
+
+          {:error, reason}
+      end
+    catch
+      :exit, reason ->
+        duration = System.monotonic_time() - start_time
+
+        :telemetry.execute(
+          [:resiliency, :single_flight, :flight, :exception],
+          %{duration: duration},
+          %{name: server, key: key, kind: :exit, reason: reason, stacktrace: __STACKTRACE__}
+        )
+
+        exit(reason)
+    end
   end
 
   @doc """
@@ -193,7 +300,50 @@ defmodule Resiliency.SingleFlight do
   """
   @spec flight(server(), key(), (-> term()), timeout()) :: result()
   def flight(server, key, fun, timeout) when is_function(fun, 0) do
-    GenServer.call(server, {:flight, key, fun}, timeout)
+    start_time = System.monotonic_time()
+
+    :telemetry.execute(
+      [:resiliency, :single_flight, :flight, :start],
+      %{system_time: System.system_time()},
+      %{name: server, key: key}
+    )
+
+    try do
+      case GenServer.call(server, {:flight, key, fun}, timeout) do
+        {:ok, value, shared} ->
+          duration = System.monotonic_time() - start_time
+
+          :telemetry.execute(
+            [:resiliency, :single_flight, :flight, :stop],
+            %{duration: duration},
+            %{name: server, key: key, result: :ok, shared: shared}
+          )
+
+          {:ok, value}
+
+        {:error, reason, shared} ->
+          duration = System.monotonic_time() - start_time
+
+          :telemetry.execute(
+            [:resiliency, :single_flight, :flight, :stop],
+            %{duration: duration},
+            %{name: server, key: key, result: :error, shared: shared}
+          )
+
+          {:error, reason}
+      end
+    catch
+      :exit, reason ->
+        duration = System.monotonic_time() - start_time
+
+        :telemetry.execute(
+          [:resiliency, :single_flight, :flight, :exception],
+          %{duration: duration},
+          %{name: server, key: key, kind: :exit, reason: reason, stacktrace: __STACKTRACE__}
+        )
+
+        exit(reason)
+    end
   end
 
   @doc """

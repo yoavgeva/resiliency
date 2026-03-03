@@ -117,8 +117,16 @@ defmodule Resiliency.SingleFlight.Server do
   end
 
   defp reply_to_all(callers, result) do
-    Enum.each(callers, fn from ->
-      GenServer.reply(from, result)
-    end)
+    case Enum.reverse(callers) do
+      [leader | followers] ->
+        GenServer.reply(leader, tag_result(result, false))
+        Enum.each(followers, &GenServer.reply(&1, tag_result(result, true)))
+
+      [] ->
+        :ok
+    end
   end
+
+  defp tag_result({:ok, value}, shared), do: {:ok, value, shared}
+  defp tag_result({:error, reason}, shared), do: {:error, reason, shared}
 end

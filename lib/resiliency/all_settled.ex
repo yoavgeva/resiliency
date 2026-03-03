@@ -51,6 +51,64 @@ defmodule Resiliency.AllSettled do
       ], timeout: 1_000)
       # => [{:ok, result}, {:error, :timeout}]
 
+  ## Telemetry
+
+  All events are emitted in the caller's process via `:telemetry.span/3`. See
+  `Resiliency.Telemetry` for the complete event catalogue.
+
+  ### `[:resiliency, :all_settled, :run, :start]`
+
+  Emitted before tasks are spawned.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `system_time` | `integer` | `System.system_time()` at emission time |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `count` | `integer` | Number of functions submitted |
+
+  ### `[:resiliency, :all_settled, :run, :stop]`
+
+  Emitted after all tasks complete (or timeout).
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units (`System.monotonic_time/0` delta) |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `count` | `integer` | Total number of tasks |
+  | `ok_count` | `integer` | Number of tasks that returned `{:ok, _}` |
+  | `error_count` | `integer` | Number of tasks that returned `{:error, _}` |
+
+  ### `[:resiliency, :all_settled, :run, :exception]`
+
+  Emitted if `run/2` raises or exits unexpectedly.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `count` | `integer` | Number of functions submitted |
+  | `kind` | `atom` | Exception kind (`:error`, `:exit`, or `:throw`) |
+  | `reason` | `term` | The exception or exit reason |
+  | `stacktrace` | `list` | Stack at the point of the exception |
+
   """
 
   import Resiliency.TaskHelper,
@@ -93,17 +151,26 @@ defmodule Resiliency.AllSettled do
   def run([], _opts), do: []
 
   def run(funs, opts) do
-    timeout = Keyword.get(opts, :timeout, :infinity)
+    count = length(funs)
+    meta = %{count: count}
 
-    tasks = Enum.map(funs, &spawn_task/1)
-    ref_to_index = Map.new(Enum.with_index(tasks), fn {task, i} -> {task.ref, i} end)
-    results = :array.new(length(tasks), default: nil)
+    :telemetry.span([:resiliency, :all_settled, :run], meta, fn ->
+      timeout = Keyword.get(opts, :timeout, :infinity)
+      tasks = Enum.map(funs, &spawn_task/1)
+      ref_to_index = Map.new(Enum.with_index(tasks), fn {task, i} -> {task.ref, i} end)
+      results = :array.new(length(tasks), default: nil)
+      results = collect_all(tasks, ref_to_index, results, length(tasks), timeout)
 
-    results = collect_all(tasks, ref_to_index, results, length(tasks), timeout)
+      result_list =
+        for i <- 0..(length(tasks) - 1) do
+          :array.get(i, results)
+        end
 
-    for i <- 0..(length(tasks) - 1) do
-      :array.get(i, results)
-    end
+      ok_count = Enum.count(result_list, &match?({:ok, _}, &1))
+      error_count = count - ok_count
+
+      {result_list, %{count: count, ok_count: ok_count, error_count: error_count}}
+    end)
   end
 
   defp collect_all(_tasks, _ref_to_index, results, 0, _timeout), do: results

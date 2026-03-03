@@ -79,6 +79,82 @@ defmodule Resiliency.BackoffRetry do
     * `:sleep_fn` — sleep function, defaults to `Process.sleep/1`
     * `:reraise` — `true` to re-raise rescued exceptions with original stacktrace when retries are exhausted (default: `false`)
 
+  ## Telemetry
+
+  All events are emitted in the caller's process. See `Resiliency.Telemetry` for the
+  complete event catalogue.
+
+  ### `[:resiliency, :retry, :start]`
+
+  Emitted before the first attempt.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `system_time` | `integer` | `System.system_time()` at emission time |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `max_attempts` | `integer` | Configured maximum number of attempts |
+
+  ### `[:resiliency, :retry, :stop]`
+
+  Emitted after the operation completes — either success or exhausted retries (without re-raise).
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units (`System.monotonic_time/0` delta) |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `max_attempts` | `integer` | Configured maximum number of attempts |
+  | `attempts` | `integer` | Actual number of attempts made |
+  | `result` | `:ok \| :error` | `:ok` on success, `:error` on failure |
+
+  ### `[:resiliency, :retry, :exception]`
+
+  Emitted instead of `:stop` when `reraise: true` and a rescued exception exhausts all retries.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `max_attempts` | `integer` | Configured maximum number of attempts |
+  | `attempts` | `integer` | Actual number of attempts made |
+  | `kind` | `:error` | Always `:error` (rescued exception) |
+  | `reason` | `Exception.t()` | The exception struct |
+  | `stacktrace` | `list` | Original exception stacktrace |
+
+  ### `[:resiliency, :retry, :retry]`
+
+  Emitted before each retry sleep, after a failed attempt that will be retried.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `delay` | `integer` | Sleep duration in milliseconds before next attempt |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `attempt` | `integer` | The attempt number that just failed (1-based) |
+  | `error` | `term` | The error that triggered the retry (`{:error, reason}` form) |
+
   """
 
   defmodule Abort do
@@ -171,13 +247,23 @@ defmodule Resiliency.BackoffRetry do
         ms -> System.monotonic_time(:millisecond) + ms
       end
 
+    start_time = System.monotonic_time()
+
+    :telemetry.execute(
+      [:resiliency, :retry, :start],
+      %{system_time: System.system_time()},
+      %{max_attempts: max_attempts}
+    )
+
     ctx = %{
       fun: fun,
       retry_if: retry_if,
       on_retry: on_retry,
       sleep_fn: sleep_fn,
       deadline: deadline,
-      reraise: reraise
+      reraise: reraise,
+      start_time: start_time,
+      max_attempts: max_attempts
     }
 
     do_retry(ctx, delays, 1)
@@ -186,9 +272,25 @@ defmodule Resiliency.BackoffRetry do
   defp do_retry(ctx, delays, attempt) do
     case execute(ctx.fun) do
       {:ok, value} ->
+        duration = System.monotonic_time() - ctx.start_time
+
+        :telemetry.execute(
+          [:resiliency, :retry, :stop],
+          %{duration: duration},
+          %{max_attempts: ctx.max_attempts, attempts: attempt, result: :ok}
+        )
+
         {:ok, value}
 
       {:error, %Abort{reason: reason}} ->
+        duration = System.monotonic_time() - ctx.start_time
+
+        :telemetry.execute(
+          [:resiliency, :retry, :stop],
+          %{duration: duration},
+          %{max_attempts: ctx.max_attempts, attempts: attempt, result: :error}
+        )
+
         {:error, reason}
 
       {:error, {:__rescued__, exception, stacktrace}} ->
@@ -200,22 +302,57 @@ defmodule Resiliency.BackoffRetry do
     end
   end
 
-  defp maybe_retry(ctx, [], _attempt, reason, _error, stacktrace) do
+  defp maybe_retry(ctx, [], attempt, reason, _error, stacktrace) do
+    emit_retry_stop(ctx, attempt, reason, stacktrace)
     maybe_reraise(ctx, reason, stacktrace)
   end
 
   defp maybe_retry(ctx, [delay | rest], attempt, reason, error, stacktrace) do
     cond do
       not ctx.retry_if.(error) ->
+        emit_retry_stop(ctx, attempt, reason, stacktrace)
         maybe_reraise(ctx, reason, stacktrace)
 
       budget_exceeded?(ctx.deadline, delay) ->
+        emit_retry_stop(ctx, attempt, reason, stacktrace)
         maybe_reraise(ctx, reason, stacktrace)
 
       true ->
+        :telemetry.execute(
+          [:resiliency, :retry, :retry],
+          %{delay: delay},
+          %{attempt: attempt, error: error}
+        )
+
         if ctx.on_retry, do: ctx.on_retry.(attempt, delay, error)
         ctx.sleep_fn.(delay)
         do_retry(ctx, rest, attempt + 1)
+    end
+  end
+
+  defp emit_retry_stop(ctx, attempt, reason, stacktrace) do
+    duration = System.monotonic_time() - ctx.start_time
+
+    max_attempts = ctx.max_attempts
+
+    if ctx.reraise and is_exception(reason) and is_list(stacktrace) do
+      :telemetry.execute(
+        [:resiliency, :retry, :exception],
+        %{duration: duration},
+        %{
+          max_attempts: max_attempts,
+          attempts: attempt,
+          kind: :error,
+          reason: reason,
+          stacktrace: stacktrace
+        }
+      )
+    else
+      :telemetry.execute(
+        [:resiliency, :retry, :stop],
+        %{duration: duration},
+        %{max_attempts: max_attempts, attempts: attempt, result: :error}
+      )
     end
   end
 

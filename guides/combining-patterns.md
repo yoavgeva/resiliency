@@ -23,6 +23,7 @@ at once:
 | Tail latency (p99 spikes) | `Hedged` | Fires a backup request after a delay, takes whichever finishes first |
 | Thundering herd (cache stampede) | `SingleFlight` | Deduplicates concurrent calls so the function executes once per key |
 | Downstream overload | `WeightedSemaphore` | Bounds concurrency to protect the downstream service |
+| Workload isolation | `Bulkhead` | Limits per-partition concurrency with rejection semantics |
 
 When you call an external payment API, a single retry loop is not enough. The
 payment service might be slow (hedging helps), your retries might fan out across
@@ -380,6 +381,81 @@ Always place deduplication outside retry.
 
 ---
 
+## Pattern: CircuitBreaker + Bulkhead
+
+**Scenario** -- You are calling a payment API that occasionally has sustained
+outages. You want the circuit breaker to stop calling the service when it is
+down, and the bulkhead to limit concurrent calls when it is up -- preventing
+your application from overwhelming the API with too many requests.
+
+The circuit breaker wraps the bulkhead. When the circuit is open, calls are
+rejected immediately without consuming a bulkhead permit. When the circuit
+is closed, the bulkhead limits concurrency.
+
+```elixir
+defmodule MyApp.PaymentClient do
+  @moduledoc """
+  Payment client with circuit breaker and bulkhead.
+
+  The circuit breaker rejects calls when the service is known to be down.
+  The bulkhead limits concurrent calls to 10 when the service is up.
+  """
+
+  @breaker MyApp.Payment.Breaker
+  @bulkhead MyApp.Payment.Bulkhead
+
+  @spec charge(String.t(), pos_integer()) :: {:ok, map()} | {:error, any()}
+  def charge(payment_method_id, amount_cents) do
+    case Resiliency.CircuitBreaker.call(@breaker, fn ->
+           case Resiliency.Bulkhead.call(@bulkhead, fn ->
+                  do_charge(payment_method_id, amount_cents)
+                end) do
+             {:ok, result} -> result
+             {:error, :bulkhead_full} -> {:error, :bulkhead_full}
+             {:error, reason} -> {:error, reason}
+           end
+         end) do
+      {:ok, {:ok, transaction}} -> {:ok, transaction}
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:error, :circuit_open} -> {:error, :service_degraded}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp do_charge(payment_method_id, amount_cents) do
+    case HttpClient.post("https://payments.example.com/v1/charges", %{
+           payment_method: payment_method_id,
+           amount: amount_cents
+         }) do
+      {:ok, %{status: 200, body: body}} -> {:ok, body}
+      {:ok, %{status: 402, body: body}} -> {:error, {:payment_declined, body}}
+      {:ok, %{status: status}} -> {:error, {:unexpected_status, status}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+end
+```
+
+### Supervision tree
+
+```elixir
+children = [
+  {Resiliency.CircuitBreaker,
+   name: MyApp.Payment.Breaker,
+   failure_rate_threshold: 0.5,
+   open_timeout: 30_000},
+
+  {Resiliency.Bulkhead,
+   name: MyApp.Payment.Bulkhead,
+   max_concurrent: 10,
+   max_wait: 5_000}
+]
+
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+---
+
 ## Pattern: Full Resilience Stack
 
 **Scenario** -- You are building a product catalog service that queries a slow,
@@ -392,9 +468,10 @@ The composition order, from outermost to innermost:
 
 0. **CircuitBreaker** -- Reject calls when the downstream is known to be down.
 1. **SingleFlight** -- Deduplicate concurrent callers for the same product.
-2. **WeightedSemaphore** -- Bound total concurrent outbound requests.
-3. **BackoffRetry** -- Retry transient failures with exponential backoff.
-4. **Hedged** -- Cut tail latency on each individual attempt.
+2. **Bulkhead** -- Isolate this workload with its own concurrency limit.
+3. **WeightedSemaphore** -- Bound total concurrent outbound requests.
+4. **BackoffRetry** -- Retry transient failures with exponential backoff.
+5. **Hedged** -- Cut tail latency on each individual attempt.
 
 ```elixir
 defmodule MyApp.Inventory do
@@ -412,6 +489,7 @@ defmodule MyApp.Inventory do
 
   @breaker MyApp.Inventory.Breaker
   @flight MyApp.Inventory.Flight
+  @bulkhead MyApp.Inventory.Bulkhead
   @semaphore MyApp.Inventory.Semaphore
   @tracker MyApp.Inventory.Tracker
 
@@ -568,10 +646,10 @@ circuit is open, downstream impact is zero.
 
 ## Supervision Tree Design
 
-When combining multiple patterns, all stateful components -- `CircuitBreaker`,
-`Hedged.Tracker`, `SingleFlight`, and `WeightedSemaphore` -- need to be started
-under a supervisor. `BackoffRetry`, `Race`, `AllSettled`, `Map`, and `FirstOk`
-are stateless and require no supervision.
+When combining multiple patterns, all stateful components -- `Bulkhead`,
+`CircuitBreaker`, `Hedged.Tracker`, `SingleFlight`, and `WeightedSemaphore` --
+need to be started under a supervisor. `BackoffRetry`, `Race`, `AllSettled`,
+`Map`, and `FirstOk` are stateless and require no supervision.
 
 ### Grouping by domain
 
@@ -605,6 +683,11 @@ defmodule MyApp.Application do
        failure_rate_threshold: 0.5,
        open_timeout: 60_000},
 
+      {Resiliency.Bulkhead,
+       name: MyApp.PaymentGateway.Bulkhead,
+       max_concurrent: 10,
+       max_wait: 5_000},
+
       {Resiliency.Hedged,
        name: MyApp.PaymentGateway.Tracker,
        percentile: 99,
@@ -637,6 +720,11 @@ defmodule MyApp.Application do
       {Resiliency.SingleFlight,
        name: MyApp.Inventory.Flight},
 
+      {Resiliency.Bulkhead,
+       name: MyApp.Inventory.Bulkhead,
+       max_concurrent: 15,
+       max_wait: 3_000},
+
       {Resiliency.WeightedSemaphore,
        name: MyApp.Inventory.Semaphore,
        max: 20},
@@ -660,6 +748,9 @@ Each stateful module provides a `child_spec/1` that works with standard
 ```elixir
 # CircuitBreaker -- failure-rate circuit breaker
 {Resiliency.CircuitBreaker, name: MyApp.Breaker, failure_rate_threshold: 0.5}
+
+# Bulkhead -- workload isolation with rejection semantics
+{Resiliency.Bulkhead, name: MyApp.Bulkhead, max_concurrent: 10}
 
 # Hedged.Tracker -- adaptive delay + token-bucket throttling
 {Resiliency.Hedged, name: MyApp.HedgeTracker, percentile: 95}

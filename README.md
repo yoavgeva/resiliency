@@ -17,6 +17,7 @@ A collection of resilience and concurrency primitives for Elixir.
 | `Resiliency.Map` | Bounded-concurrency parallel map with fail-fast cancellation |
 | `Resiliency.FirstOk` | Sequential fallback chain — try each function until one succeeds |
 | `Resiliency.WeightedSemaphore` | Weighted semaphore with FIFO fairness and timeout support |
+| `Resiliency.Bulkhead` | Bulkhead — isolate workloads with per-partition concurrency limits and rejection semantics |
 
 ## Installation
 
@@ -25,7 +26,7 @@ Add `resiliency` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:resiliency, "~> 0.2.0"}
+    {:resiliency, "~> 0.4.0"}
   ]
 end
 ```
@@ -117,6 +118,24 @@ end)
 
 # Non-blocking try
 :rejected = Resiliency.WeightedSemaphore.try_acquire(:my_sem, 5, fn -> :work end)
+```
+
+### Bulkhead
+
+```elixir
+# Start under a supervisor
+children = [{Resiliency.Bulkhead, name: :my_bulkhead, max_concurrent: 10}]
+Supervisor.start_link(children, strategy: :one_for_one)
+
+# Basic call — rejects immediately when full (default max_wait: 0)
+case Resiliency.Bulkhead.call(:my_bulkhead, fn -> HttpClient.get(url) end) do
+  {:ok, response} -> handle_response(response)
+  {:error, :bulkhead_full} -> {:error, :overloaded}
+  {:error, reason} -> {:error, reason}
+end
+
+# With waiting — waits up to 1s for a permit
+Resiliency.Bulkhead.call(:my_bulkhead, fn -> :work end, max_wait: 1_000)
 ```
 
 ## Migration from Individual Packages

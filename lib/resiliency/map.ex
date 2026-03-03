@@ -39,6 +39,66 @@ defmodule Resiliency.Map do
 
       {:error, reason} = Resiliency.Map.run(items, &process/1, max_concurrency: 5)
 
+  ## Telemetry
+
+  All events are emitted in the caller's process via `:telemetry.span/3`. See
+  `Resiliency.Telemetry` for the complete event catalogue.
+
+  ### `[:resiliency, :map, :run, :start]`
+
+  Emitted before processing begins.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `system_time` | `integer` | `System.system_time()` at emission time |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `count` | `integer` | Number of items to process |
+  | `max_concurrency` | `integer` | Maximum concurrent tasks |
+
+  ### `[:resiliency, :map, :run, :stop]`
+
+  Emitted after all items complete or on the first failure.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units (`System.monotonic_time/0` delta) |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `count` | `integer` | Number of items submitted |
+  | `max_concurrency` | `integer` | Maximum concurrent tasks |
+  | `result` | `:ok \| :error` | `:ok` if all items succeeded, `:error` on first failure |
+
+  ### `[:resiliency, :map, :run, :exception]`
+
+  Emitted if `run/3` raises or exits unexpectedly.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `count` | `integer` | Number of items submitted |
+  | `max_concurrency` | `integer` | Maximum concurrent tasks |
+  | `kind` | `atom` | Exception kind (`:error`, `:exit`, or `:throw`) |
+  | `reason` | `term` | The exception or exit reason |
+  | `stacktrace` | `list` | Stack at the point of the exception |
+
   """
 
   import Resiliency.TaskHelper,
@@ -85,8 +145,23 @@ defmodule Resiliency.Map do
       _ ->
         max_concurrency = Keyword.get(opts, :max_concurrency, System.schedulers_online())
         timeout = Keyword.get(opts, :timeout, :infinity)
-        do_map(items, fun, max_concurrency, timeout)
+        meta = %{count: length(items), max_concurrency: max_concurrency}
+        run_with_telemetry(items, fun, max_concurrency, timeout, meta)
     end
+  end
+
+  defp run_with_telemetry(items, fun, max_concurrency, timeout, meta) do
+    :telemetry.span([:resiliency, :map, :run], meta, fn ->
+      result = do_map(items, fun, max_concurrency, timeout)
+
+      result_key =
+        case result do
+          {:ok, _} -> :ok
+          {:error, _} -> :error
+        end
+
+      {result, %{count: meta.count, max_concurrency: meta.max_concurrency, result: result_key}}
+    end)
   end
 
   defp do_map(items, fun, max_concurrency, timeout) do

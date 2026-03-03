@@ -13,7 +13,7 @@ Add `resiliency` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:resiliency, "~> 0.3.0"}
+    {:resiliency, "~> 0.4.0"}
   ]
 end
 ```
@@ -562,6 +562,98 @@ large requests.
 
 ---
 
+## Your First Bulkhead
+
+`Resiliency.Bulkhead` isolates workloads by limiting how many concurrent
+calls can execute against a downstream service. When the limit is reached,
+callers are either rejected immediately or queued for a configurable wait
+time. This prevents one slow service from consuming all available resources.
+
+### 1. Start the bulkhead
+
+```elixir
+{:ok, _pid} =
+  Resiliency.Bulkhead.start_link(
+    name: MyApp.PaymentBulkhead,
+    max_concurrent: 10
+  )
+```
+
+### 2. Basic call
+
+```elixir
+case Resiliency.Bulkhead.call(MyApp.PaymentBulkhead, fn ->
+  HttpClient.post("https://payments.example.com/charge", payload)
+end) do
+  {:ok, response} -> handle_response(response)
+  {:error, :bulkhead_full} -> {:error, :overloaded}
+  {:error, reason} -> {:error, reason}
+end
+```
+
+By default, `max_wait` is `0` — callers are rejected immediately when the
+bulkhead is full. This is the safest default for latency-sensitive services.
+
+### 3. Wait for a permit
+
+If you prefer callers to queue instead of failing immediately, set `max_wait`:
+
+```elixir
+{:ok, _pid} =
+  Resiliency.Bulkhead.start_link(
+    name: MyApp.PaymentBulkhead,
+    max_concurrent: 10,
+    max_wait: 5_000
+  )
+```
+
+Now callers wait up to 5 seconds for a permit before being rejected.
+
+### 4. Per-call override
+
+You can override the server's default `max_wait` on a per-call basis:
+
+```elixir
+# This call waits up to 1 second, regardless of server default
+Resiliency.Bulkhead.call(MyApp.PaymentBulkhead, fn ->
+  HttpClient.post(url, payload)
+end, max_wait: 1_000)
+```
+
+### 5. Monitor with callbacks
+
+```elixir
+Resiliency.Bulkhead.start_link(
+  name: MyApp.PaymentBulkhead,
+  max_concurrent: 10,
+  on_call_permitted: fn name ->
+    Logger.info("#{name}: call permitted")
+  end,
+  on_call_rejected: fn name ->
+    Logger.warning("#{name}: call rejected — bulkhead full")
+  end,
+  on_call_finished: fn name ->
+    Logger.info("#{name}: call finished")
+  end
+)
+```
+
+### 6. Supervision tree integration
+
+```elixir
+children = [
+  {Resiliency.Bulkhead,
+   name: MyApp.PaymentBulkhead,
+   max_concurrent: 10,
+   max_wait: 5_000},
+  # ... other children
+]
+
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+---
+
 ## Your First Circuit Breaker
 
 `Resiliency.CircuitBreaker` monitors call outcomes and "trips" when the
@@ -715,6 +807,9 @@ hedging).
 
 Now that you have the fundamentals, explore further:
 
+- **[`Resiliency.Bulkhead`](Resiliency.Bulkhead.html)** --
+  named concurrency limiter with FIFO wait queues, per-call `max_wait`
+  overrides, and callback-based observability.
 - **[`Resiliency.CircuitBreaker`](Resiliency.CircuitBreaker.html)** --
   sliding window, failure rate thresholds, slow call detection, half-open
   probing, manual control, and callback-based observability.

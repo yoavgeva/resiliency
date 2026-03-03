@@ -84,6 +84,63 @@ defmodule Resiliency.Hedged do
     * `:error` — `{:error, :error}`
     * raise / exit / throw — captured, treated as failure
 
+  ## Telemetry
+
+  All events are emitted in the caller's process. See `Resiliency.Telemetry` for the
+  complete event catalogue.
+
+  ### `[:resiliency, :hedged, :run, :start]`
+
+  Emitted at the beginning of every `run/2,3` invocation.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `system_time` | `integer` | `System.system_time()` at emission time |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `mode` | `:stateless \| :adaptive` | `:stateless` for `run/2` (fun/opts), `:adaptive` for `run/3` (server/fun/opts) |
+
+  ### `[:resiliency, :hedged, :hedge]`
+
+  Emitted each time a hedge is dispatched (2nd, 3rd, … request). Not emitted for the
+  original request.
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | _(none)_ | | |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `attempt` | `integer` | Hedge attempt number (2 for first hedge, 3 for second, etc.) |
+
+  ### `[:resiliency, :hedged, :run, :stop]`
+
+  Emitted after the first successful response (or after all attempts fail).
+
+  **Measurements**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `duration` | `integer` | Elapsed native time units (`System.monotonic_time/0` delta) |
+
+  **Metadata**
+
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `mode` | `:stateless \| :adaptive` | Matches the `:start` event |
+  | `result` | `:ok \| :error` | `:ok` if any attempt succeeded, `:error` if all failed |
+  | `dispatched` | `integer` | Total number of attempts dispatched (including original) |
+  | `hedged` | `boolean` | `true` if at least one hedge was dispatched (`dispatched > 1`) |
+
   """
 
   @typedoc "Options for stateless `run/2`."
@@ -145,18 +202,62 @@ defmodule Resiliency.Hedged do
   def run(fun) when is_function(fun, 0), do: run(fun, [])
 
   def run(fun, opts) when is_function(fun, 0) and is_list(opts) do
+    original_on_hedge = Keyword.get(opts, :on_hedge)
+
+    wrapped_on_hedge = fn attempt ->
+      :telemetry.execute([:resiliency, :hedged, :hedge], %{}, %{attempt: attempt})
+      if original_on_hedge, do: original_on_hedge.(attempt)
+    end
+
     runner_opts = [
       delay: Keyword.get(opts, :delay, 100),
       max_requests: Keyword.get(opts, :max_requests, 2),
       timeout: Keyword.get(opts, :timeout, 5_000),
       non_fatal: Keyword.get(opts, :non_fatal, fn _ -> false end),
-      on_hedge: Keyword.get(opts, :on_hedge),
+      on_hedge: wrapped_on_hedge,
       now_fn: Keyword.get(opts, :now_fn, &System.monotonic_time/1)
     ]
 
+    start_time = System.monotonic_time()
+
+    :telemetry.execute(
+      [:resiliency, :hedged, :run, :start],
+      %{system_time: System.system_time()},
+      %{mode: :stateless}
+    )
+
     case Resiliency.Hedged.Runner.execute(fun, runner_opts) do
-      {:ok, value, _meta} -> {:ok, value}
-      {:error, reason, _meta} -> {:error, reason}
+      {:ok, value, meta} ->
+        duration = System.monotonic_time() - start_time
+
+        :telemetry.execute(
+          [:resiliency, :hedged, :run, :stop],
+          %{duration: duration},
+          %{
+            mode: :stateless,
+            result: :ok,
+            dispatched: meta.dispatched,
+            hedged: meta.dispatched > 1
+          }
+        )
+
+        {:ok, value}
+
+      {:error, reason, meta} ->
+        duration = System.monotonic_time() - start_time
+
+        :telemetry.execute(
+          [:resiliency, :hedged, :run, :stop],
+          %{duration: duration},
+          %{
+            mode: :stateless,
+            result: :error,
+            dispatched: meta.dispatched,
+            hedged: meta.dispatched > 1
+          }
+        )
+
+        {:error, reason}
     end
   end
 
@@ -203,20 +304,46 @@ defmodule Resiliency.Hedged do
         do: Keyword.get(opts, :max_requests, 2),
         else: 1
 
+    original_on_hedge = Keyword.get(opts, :on_hedge)
+
+    wrapped_on_hedge = fn attempt ->
+      :telemetry.execute([:resiliency, :hedged, :hedge], %{}, %{attempt: attempt})
+      if original_on_hedge, do: original_on_hedge.(attempt)
+    end
+
     runner_opts = [
       delay: delay,
       max_requests: max_requests,
       timeout: Keyword.get(opts, :timeout, 5_000),
       non_fatal: Keyword.get(opts, :non_fatal, fn _ -> false end),
-      on_hedge: Keyword.get(opts, :on_hedge),
+      on_hedge: wrapped_on_hedge,
       now_fn: now_fn
     ]
 
-    start_time = now_fn.(:millisecond)
+    start_time_ms = now_fn.(:millisecond)
+    start_time = System.monotonic_time()
+
+    :telemetry.execute(
+      [:resiliency, :hedged, :run, :start],
+      %{system_time: System.system_time()},
+      %{mode: :adaptive}
+    )
 
     case Resiliency.Hedged.Runner.execute(fun, runner_opts) do
       {:ok, value, meta} ->
-        latency_ms = now_fn.(:millisecond) - start_time
+        duration = System.monotonic_time() - start_time
+        latency_ms = now_fn.(:millisecond) - start_time_ms
+
+        :telemetry.execute(
+          [:resiliency, :hedged, :run, :stop],
+          %{duration: duration},
+          %{
+            mode: :adaptive,
+            result: :ok,
+            dispatched: meta.dispatched,
+            hedged: meta.dispatched > 1
+          }
+        )
 
         Resiliency.Hedged.Tracker.record(server, %{
           latency_ms: latency_ms,
@@ -227,7 +354,19 @@ defmodule Resiliency.Hedged do
         {:ok, value}
 
       {:error, reason, meta} ->
-        latency_ms = now_fn.(:millisecond) - start_time
+        duration = System.monotonic_time() - start_time
+        latency_ms = now_fn.(:millisecond) - start_time_ms
+
+        :telemetry.execute(
+          [:resiliency, :hedged, :run, :stop],
+          %{duration: duration},
+          %{
+            mode: :adaptive,
+            result: :error,
+            dispatched: meta.dispatched,
+            hedged: meta.dispatched > 1
+          }
+        )
 
         Resiliency.Hedged.Tracker.record(server, %{
           latency_ms: latency_ms,

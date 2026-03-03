@@ -464,6 +464,105 @@ CircuitBreaker.start_link(
 )
 ```
 
+## Bulkhead
+{: .col-2}
+
+### Start
+
+```elixir
+# In supervision tree
+children = [
+  {Resiliency.Bulkhead,
+   name: MyApp.ApiBulkhead,
+   max_concurrent: 10}
+]
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+### Basic Call
+
+```elixir
+alias Resiliency.Bulkhead
+
+case Bulkhead.call(MyApp.ApiBulkhead, fn ->
+  HttpClient.get(url)
+end) do
+  {:ok, response} -> handle(response)
+  {:error, :bulkhead_full} -> :overloaded
+  {:error, reason} -> {:error, reason}
+end
+```
+
+### With Waiting
+
+```elixir
+# Server default max_wait
+Bulkhead.start_link(
+  name: MyApp.ApiBulkhead,
+  max_concurrent: 10,
+  max_wait: 5_000
+)
+
+# Waits up to 5s for a permit
+Bulkhead.call(MyApp.ApiBulkhead, fn -> :work end)
+# => {:ok, :work} | {:error, :bulkhead_full}
+```
+
+### Per-Call Override
+
+```elixir
+# Override server default for this call
+Bulkhead.call(MyApp.ApiBulkhead, fn -> :work end,
+  max_wait: 1_000
+)
+# waits up to 1s regardless of server default
+```
+
+### Get Stats
+
+```elixir
+Bulkhead.get_stats(MyApp.ApiBulkhead)
+# => %{max_concurrent: 10, current: 3,
+#       available: 7, waiting: 0}
+```
+
+### Reset
+
+```elixir
+Bulkhead.reset(MyApp.ApiBulkhead)
+# => :ok  (rejects all waiters, clears permits)
+```
+
+### Callbacks
+
+```elixir
+Bulkhead.start_link(
+  name: MyApp.ApiBulkhead,
+  max_concurrent: 10,
+  on_call_permitted: fn name ->
+    Logger.info("#{name}: call permitted")
+  end,
+  on_call_rejected: fn name ->
+    Logger.warning("#{name}: call rejected")
+  end,
+  on_call_finished: fn name ->
+    Logger.info("#{name}: call finished")
+  end
+)
+```
+
+### Error Handling
+
+```elixir
+# Permits auto-release even on crash
+{:error, {%RuntimeError{}, _stack}} =
+  Bulkhead.call(MyApp.ApiBulkhead, fn -> raise "boom" end)
+
+{:error, :oops} =
+  Bulkhead.call(MyApp.ApiBulkhead, fn -> exit(:oops) end)
+# next queued caller proceeds automatically
+```
+
 ## WeightedSemaphore
 {: .col-2}
 
