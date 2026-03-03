@@ -18,6 +18,7 @@ A collection of resilience and concurrency primitives for Elixir.
 | `Resiliency.FirstOk` | Sequential fallback chain — try each function until one succeeds |
 | `Resiliency.WeightedSemaphore` | Weighted semaphore with FIFO fairness and timeout support |
 | `Resiliency.Bulkhead` | Bulkhead — isolate workloads with per-partition concurrency limits and rejection semantics |
+| `Resiliency.Telemetry` | Built-in `:telemetry` events — spans and point events for every module |
 
 ## Installation
 
@@ -26,7 +27,7 @@ Add `resiliency` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:resiliency, "~> 0.4.0"}
+    {:resiliency, "~> 0.5.0"}
   ]
 end
 ```
@@ -137,6 +138,35 @@ end
 # With waiting — waits up to 1s for a permit
 Resiliency.Bulkhead.call(:my_bulkhead, fn -> :work end, max_wait: 1_000)
 ```
+
+### Telemetry
+
+All modules emit `:telemetry` events out of the box — no configuration required. Attach handlers using the standard `:telemetry` API:
+
+```elixir
+# Log every retry
+:telemetry.attach(
+  "my-app-retry-logger",
+  [:resiliency, :retry, :retry],
+  fn _event, %{delay: delay}, %{attempt: attempt, error: error}, _config ->
+    Logger.warning("Retry attempt=#{attempt} delay=#{delay}ms error=#{inspect(error)}")
+  end,
+  nil
+)
+
+# Track circuit breaker state changes
+:telemetry.attach(
+  "my-app-cb-state",
+  [:resiliency, :circuit_breaker, :state_change],
+  fn _event, _measurements, %{name: name, from: from, to: to}, _config ->
+    MyApp.Metrics.increment("circuit_breaker.state_change",
+      tags: [name: name, from: from, to: to])
+  end,
+  nil
+)
+```
+
+See `Resiliency.Telemetry` for the full event catalogue with all measurements and metadata keys.
 
 ## Migration from Individual Packages
 

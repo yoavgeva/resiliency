@@ -37,7 +37,7 @@ defmodule Resiliency.MixProject do
     [
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url},
-      files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
+      files: ~w(lib .formatter.exs mix.exs README.md CHANGELOG.md LICENSE)
     ]
   end
 
@@ -54,6 +54,7 @@ defmodule Resiliency.MixProject do
         "guides/combining-patterns.md",
         "guides/tuning-and-observability.md",
         "cheatsheets/resiliency.cheatmd",
+        "CHANGELOG.md",
         "LICENSE"
       ],
       groups_for_extras: [
