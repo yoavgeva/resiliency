@@ -15,8 +15,9 @@ recommendations for common workloads.
 4. [SingleFlight Tuning](#singleflight-tuning)
 5. [Task Combinator Tuning](#task-combinator-tuning)
 6. [WeightedSemaphore Tuning](#weightedsemaphore-tuning)
-7. [Observability](#observability)
-8. [Common Pitfalls](#common-pitfalls)
+7. [RateLimiter Tuning](#ratelimiter-tuning)
+8. [Observability](#observability)
+9. [Common Pitfalls](#common-pitfalls)
 
 ---
 
@@ -458,6 +459,119 @@ Utilization = avg_concurrent_weight / max
 
 ---
 
+## RateLimiter Tuning
+
+### Parameter Reference
+
+| Parameter | Default | Range | Effect |
+|---|---|---|---|
+| `:name` | -- (required) | atom | Registered name for the GenServer and `persistent_term` config key. |
+| `:rate` | -- (required) | positive number | Refill rate in tokens per second. |
+| `:burst_size` | -- (required) | positive integer | Bucket capacity and initial fill. |
+| `:on_reject` | `nil` | `fn name -> any` or `nil` | Callback fired in the caller's process on every rejection. |
+| `weight` (per-call) | `1` | positive integer | Tokens consumed per call. |
+
+### How It Works
+
+The rate limiter uses a **lazy token-bucket** — there is no background timer.
+Tokens refill on each call based on elapsed time since the last operation:
+
+```
+new_tokens = min(burst_size, old_tokens + elapsed_ms * rate_per_ms)
+```
+
+If `new_tokens >= weight`, the call is granted and `weight` tokens are deducted.
+Otherwise the call is rejected immediately. The hot path (grant and reject) runs
+entirely in the caller's process via lock-free ETS operations — no GenServer
+message is sent.
+
+### Choosing `rate` and `burst_size`
+
+| Goal | `rate` | `burst_size` | Notes |
+|---|---|---|---|
+| Match an external API limit of 100 req/s | `100.0` | `100` or `10` | `burst_size = rate` gives a one-second burst. Lower it to smooth traffic more aggressively. |
+| Allow occasional bursts, then throttle | `50.0` | `500` | Bucket fills slowly but callers can burst to 500 before being throttled. |
+| Strict per-second limit, no burst | `100.0` | `1` | Only 1 token ever available; at most 1 call per ~10ms. |
+| Expensive operation (weight 5) at 20/s | `100.0` | `100` | Each call costs 5 tokens; effective rate = 100 / 5 = 20 op/s. |
+
+### `rate` vs `burst_size` Interaction
+
+```
+# Steady-state throughput (tokens/s) = rate
+# Burst capacity (tokens) = burst_size
+# Time to refill from empty = burst_size / rate seconds
+```
+
+A full empty bucket refills in `burst_size / rate` seconds. If burst_size equals
+rate, the bucket refills in exactly one second. If burst_size is much larger than
+rate, callers can absorb large traffic spikes before the rate limit kicks in.
+
+### `retry_after_ms` Formula
+
+When a call is rejected, the hint is:
+
+```
+retry_after_ms = ceil((weight - current_tokens) / rate * 1000)
+```
+
+This tells the caller exactly how long to wait for enough tokens to refill for
+their specific weight. Callers should treat this as a minimum — token counts are
+shared across concurrent callers.
+
+### Weighted Calls
+
+Use `:weight` when different operations have different costs relative to your
+upstream rate limit. For example, if an API counts bulk requests as equivalent to
+N single requests, pass `weight: N`:
+
+```elixir
+# Single item lookup: 1 token
+Resiliency.RateLimiter.call(rl, fn -> get_one(id) end)
+
+# Bulk fetch of 50 items: 50 tokens
+Resiliency.RateLimiter.call(rl, fn -> get_many(ids) end, weight: 50)
+```
+
+A `weight` larger than `burst_size` is always rejected immediately.
+
+### `get_stats/1` Usage
+
+`get_stats/1` computes the projected token count using the current timestamp,
+without writing to ETS or consuming any tokens. Use it for health checks and
+dashboards — it does not interfere with the hot path:
+
+```elixir
+%{tokens: tokens, rate: rate, burst_size: burst_size} =
+  Resiliency.RateLimiter.get_stats(MyApp.ApiRateLimiter)
+
+utilization = (burst_size - tokens) / burst_size
+# 0.0 = full bucket (no recent calls)
+# 1.0 = empty bucket (fully rate limited)
+```
+
+### Performance Characteristics
+
+The hot path avoids GenServer messages entirely:
+
+- **Grant path**: `persistent_term.get` + ETS lookup + float refill math + ETS CAS (`select_replace`)
+- **Reject path**: `persistent_term.get` + ETS lookup + float refill math + ETS `update_element`
+
+Observed on M-series hardware: ~3µs/call for grants, ~2µs/call for rejects. Under
+8 concurrent processes, reductions per acquire stay flat (< 100) — no serialisation.
+
+### Common Pitfalls
+
+| Mistake | Symptom | Fix |
+|---|---|---|
+| `burst_size` too small | Legitimate bursts are rejected; traffic is over-smoothed. | Set `burst_size` to match the upstream's burst allowance. |
+| `burst_size` too large | Bucket takes minutes to refill after a burst; callers see `retry_after_ms` in the thousands. | Cap `burst_size` at `rate * acceptable_burst_seconds`. |
+| `weight > burst_size` | Calls with that weight are always rejected. | Ensure max weight is <= `burst_size`. Validate at startup. |
+| Treating `retry_after_ms` as exact | Token counts are shared; another caller may consume tokens before you retry. | Add a small jitter to the `retry_after_ms` before sleeping. |
+| Using RateLimiter for concurrency | Bucket drains after a burst even if calls are all in-flight simultaneously. | Use `Bulkhead` or `WeightedSemaphore` for concurrency limits. |
+| Starting without a supervisor | GenServer crash leaves `persistent_term` stale until process exits. | Always start under a supervisor using `child_spec/1`. |
+
+---
+
 ## Observability
 
 ### Emitting Telemetry from CircuitBreaker
@@ -750,6 +864,9 @@ end
 | Hedged | `[:app, :hedged, :tracker_stats]` | `%{p50: num, p95: num, p99: num, ...}` | `%{tracker: atom}` |
 | Semaphore | `[:app, :semaphore, :acquired]` | `%{wait_duration: native_time, weight: integer}` | `%{semaphore: atom}` |
 | Semaphore | `[:app, :semaphore, :rejected]` | `%{weight: integer}` | `%{semaphore: atom}` |
+| RateLimiter | `[:resiliency, :rate_limiter, :call, :start]` | `%{system_time: integer}` | `%{name: atom}` |
+| RateLimiter | `[:resiliency, :rate_limiter, :call, :rejected]` | `%{retry_after: integer}` | `%{name: atom}` |
+| RateLimiter | `[:resiliency, :rate_limiter, :call, :stop]` | `%{duration: native_time}` | `%{name: atom, result: :ok \| :error, error: term \| nil}` |
 
 ---
 

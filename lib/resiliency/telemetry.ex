@@ -94,5 +94,13 @@ defmodule Resiliency.Telemetry do
   | `[:resiliency, :first_ok, :run, :start]` | span | `%{system_time: integer}` | `%{count: integer}` |
   | `[:resiliency, :first_ok, :run, :stop]` | span | `%{duration: integer}` | `%{count: integer, result: :ok \\| :error, attempts: integer}` |
   | `[:resiliency, :first_ok, :run, :exception]` | span | `%{duration: integer}` | `%{count: integer, kind: atom, reason: term, stacktrace: list}` |
+
+  ## RateLimiter
+
+  | Event | Type | Measurements | Metadata |
+  |---|---|---|---|
+  | `[:resiliency, :rate_limiter, :call, :start]` | span | `%{system_time: integer}` | `%{name: term}` |
+  | `[:resiliency, :rate_limiter, :call, :stop]` | span | `%{duration: integer}` | `%{name: term, result: :ok \\| :error, error: term \\| nil}` |
+  | `[:resiliency, :rate_limiter, :call, :rejected]` | point | `%{retry_after: integer}` | `%{name: term}` |
   """
 end

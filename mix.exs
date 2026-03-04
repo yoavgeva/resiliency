@@ -1,7 +1,7 @@
 defmodule Resiliency.MixProject do
   use Mix.Project
 
-  @version "0.5.0"
+  @version "0.6.0"
   @source_url "https://github.com/yoavgeva/resiliency"
 
   def project do
@@ -85,7 +85,8 @@ defmodule Resiliency.MixProject do
         ],
         Semaphore: [Resiliency.WeightedSemaphore],
         "Circuit Breaker": [Resiliency.CircuitBreaker],
-        Bulkhead: [Resiliency.Bulkhead]
+        Bulkhead: [Resiliency.Bulkhead],
+        "Rate Limiter": [Resiliency.RateLimiter]
       ]
     ]
   end

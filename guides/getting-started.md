@@ -13,7 +13,7 @@ Add `resiliency` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:resiliency, "~> 0.4.0"}
+    {:resiliency, "~> 0.6.0"}
   ]
 end
 ```
@@ -462,6 +462,94 @@ are never called if an earlier one succeeds:
 
 ---
 
+## Rate Limiting with RateLimiter
+
+`Resiliency.RateLimiter` controls how many calls can execute per second using a
+token-bucket algorithm. When the bucket is empty, callers are rejected immediately
+with a `retry_after_ms` hint.
+
+### 1. Start the rate limiter
+
+```elixir
+{:ok, _pid} =
+  Resiliency.RateLimiter.start_link(
+    name: MyApp.ApiRateLimiter,
+    rate: 100.0,
+    burst_size: 10
+  )
+```
+
+`rate` is tokens per second; `burst_size` is the initial and maximum bucket
+size.
+
+### 2. Basic call
+
+```elixir
+case Resiliency.RateLimiter.call(MyApp.ApiRateLimiter, fn ->
+  HttpClient.get("https://api.example.com/data")
+end) do
+  {:ok, response} -> handle_response(response)
+  {:error, {:rate_limited, retry_after_ms}} -> {:error, {:overloaded, retry_after_ms}}
+  {:error, reason} -> {:error, reason}
+end
+```
+
+When rate limited, `retry_after_ms` tells the caller how many milliseconds to
+wait before retrying.
+
+### 3. Weighted calls
+
+More expensive operations can consume more tokens:
+
+```elixir
+# 1 token for a lightweight read (default)
+Resiliency.RateLimiter.call(MyApp.ApiRateLimiter, fn -> get_user(id) end)
+
+# 5 tokens for a bulk operation
+Resiliency.RateLimiter.call(MyApp.ApiRateLimiter, fn -> bulk_fetch(ids) end, weight: 5)
+```
+
+### 4. Reset and inspect
+
+```elixir
+# Reset to a full bucket (e.g., in tests or after manual intervention)
+:ok = Resiliency.RateLimiter.reset(MyApp.ApiRateLimiter)
+
+# Inspect current token count without consuming tokens
+%{tokens: _, rate: 100.0, burst_size: 10} =
+  Resiliency.RateLimiter.get_stats(MyApp.ApiRateLimiter)
+```
+
+### 5. Rejection callback
+
+Fire a callback whenever a call is rate limited:
+
+```elixir
+Resiliency.RateLimiter.start_link(
+  name: MyApp.ApiRateLimiter,
+  rate: 100.0,
+  burst_size: 10,
+  on_reject: fn name ->
+    Logger.warning("#{inspect(name)}: rate limit hit")
+  end
+)
+```
+
+### 6. Supervision tree integration
+
+```elixir
+children = [
+  {Resiliency.RateLimiter,
+   name: MyApp.ApiRateLimiter,
+   rate: 100.0,
+   burst_size: 10}
+]
+
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+---
+
 ## Rate Limiting with WeightedSemaphore
 
 `Resiliency.WeightedSemaphore` bounds concurrent access to a shared
@@ -829,3 +917,6 @@ Now that you have the fundamentals, explore further:
 - **[`Resiliency.FirstOk`](Resiliency.FirstOk.html)** -- sequential fallback chain.
 - **[`Resiliency.WeightedSemaphore`](Resiliency.WeightedSemaphore.html)** --
   FIFO fairness guarantees, error handling, `try_acquire` vs `acquire`.
+- **[`Resiliency.RateLimiter`](Resiliency.RateLimiter.html)** -- token-bucket
+  rate limiter with burst support, weighted calls, `on_reject` callback, and
+  built-in telemetry.

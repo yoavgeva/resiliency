@@ -178,6 +178,34 @@ Key traits:
 
 ---
 
+### "I need to limit how many calls execute per second"
+
+Use **`Resiliency.RateLimiter`** -- token-bucket rate limiter that rejects calls
+immediately when the bucket is empty, returning a `retry_after_ms` hint.
+
+```elixir
+children = [{Resiliency.RateLimiter, name: MyRateLimiter, rate: 100.0, burst_size: 10}]
+Supervisor.start_link(children, strategy: :one_for_one)
+
+case Resiliency.RateLimiter.call(MyRateLimiter, fn ->
+  HttpClient.get(url)
+end) do
+  {:ok, response} -> handle_response(response)
+  {:error, {:rate_limited, retry_after_ms}} -> {:error, {:overloaded, retry_after_ms}}
+  {:error, reason} -> {:error, reason}
+end
+```
+
+Key traits:
+
+- Rejects immediately -- no queuing, no blocking.
+- Returns a `retry_after_ms` hint so callers know when to try again.
+- Weighted calls -- expensive operations consume more tokens (`:weight` option).
+- Lock-free ETS hot path -- no GenServer message on the grant or reject path.
+- Stateful -- requires a GenServer (table owner + reset).
+
+---
+
 ### "I need to run tasks in parallel with richer semantics than Task"
 
 Use the stateless task combinators -- `Resiliency.Race`, `Resiliency.AllSettled`,
@@ -235,7 +263,8 @@ Key traits:
 | `Hedged` | Tail latency | No -- reduces p99 | Yes -- fires extra requests | Adaptive: yes; Stateless: no | Latency-sensitive RPCs, fan-out queries, cache lookups |
 | `SingleFlight` | Thundering herd / duplicate work | No -- late arrivals skip the I/O and share the result | No -- reduces load by deduplication | Yes | Cache population, config reloads, expensive computations with shared keys |
 | `Bulkhead` | Workload isolation | When waiting -- callers queue or reject | No -- caps it | Yes | Per-service concurrency limits, workload isolation, load shedding |
-| `WeightedSemaphore` | Unbounded concurrency | When saturated -- callers queue | No -- caps it | Yes | Database pools, API rate limits, disk I/O, GPU access |
+| `WeightedSemaphore` | Unbounded concurrency | When saturated -- callers queue | No -- caps it | Yes | Database pools, disk I/O, GPU access |
+| `RateLimiter` | Too many calls per second | No -- rejects immediately | No -- caps it | Yes | External API rate limits, smoothing bursty traffic |
 | `Race` | Need the fastest result from N sources | No -- returns the first success | Yes -- runs all concurrently | No | Multi-region fetch, redundant providers |
 | `Map` | Parallel processing with a concurrency cap | No (unless saturated) | Bounded by `max_concurrency` | No | Bulk HTTP fetches, batch processing |
 | `AllSettled` | Run all, tolerate individual failures | No | Yes -- runs all concurrently | No | Health checks, non-critical side effects, audit logging |
@@ -461,6 +490,22 @@ fresh execution -- useful after a known data change.
 
 `try_acquire/2,3` returns `:rejected` immediately if permits are unavailable --
 use it for best-effort work that can be dropped.
+
+### `Resiliency.RateLimiter`
+
+| Option | Type | Default | Recommendation |
+|---|---|---|---|
+| `:name` | atom | required | One rate limiter per upstream rate limit boundary |
+| `:rate` | positive number | required | Tokens per second; match your upstream's stated rate limit |
+| `:burst_size` | positive integer | required | Maximum burst; set to the upstream's burst allowance or a small multiple of `rate` |
+| `:on_reject` | `fn name -> any` or `nil` | `nil` | Use for logging or metrics -- fires in the caller's process |
+| `weight` (per-call) | positive integer | `1` | Model the relative cost of each operation |
+
+`get_stats/1` returns `%{tokens: float, rate: float, burst_size: integer}` — reads
+the token count read-only without consuming any tokens or updating the timestamp.
+
+`reset/1` refills the bucket to `burst_size` — useful in tests and after manual
+intervention.
 
 ### Task Combinators
 

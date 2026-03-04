@@ -24,6 +24,7 @@ at once:
 | Thundering herd (cache stampede) | `SingleFlight` | Deduplicates concurrent calls so the function executes once per key |
 | Downstream overload | `WeightedSemaphore` | Bounds concurrency to protect the downstream service |
 | Workload isolation | `Bulkhead` | Limits per-partition concurrency with rejection semantics |
+| Request frequency | `RateLimiter` | Rejects calls when tokens are exhausted; returns a retry-after hint |
 
 When you call an external payment API, a single retry loop is not enough. The
 payment service might be slow (hedging helps), your retries might fan out across
@@ -760,6 +761,9 @@ Each stateful module provides a `child_spec/1` that works with standard
 
 # WeightedSemaphore -- bounded concurrency
 {Resiliency.WeightedSemaphore, name: MyApp.Semaphore, max: 10}
+
+# RateLimiter -- token-bucket rate limiting
+{Resiliency.RateLimiter, name: MyApp.ApiRateLimiter, rate: 100.0, burst_size: 10}
 ```
 
 Each spec uses the `:name` as its child ID, so you can run multiple instances

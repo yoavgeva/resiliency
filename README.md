@@ -18,6 +18,7 @@ A collection of resilience and concurrency primitives for Elixir.
 | `Resiliency.FirstOk` | Sequential fallback chain — try each function until one succeeds |
 | `Resiliency.WeightedSemaphore` | Weighted semaphore with FIFO fairness and timeout support |
 | `Resiliency.Bulkhead` | Bulkhead — isolate workloads with per-partition concurrency limits and rejection semantics |
+| `Resiliency.RateLimiter` | Token-bucket rate limiter — control request frequency with burst support and retry-after hints |
 | `Resiliency.Telemetry` | Built-in `:telemetry` events — spans and point events for every module |
 
 ## Installation
@@ -27,7 +28,7 @@ Add `resiliency` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:resiliency, "~> 0.5.0"}
+    {:resiliency, "~> 0.6.0"}
   ]
 end
 ```
@@ -137,6 +138,24 @@ end
 
 # With waiting — waits up to 1s for a permit
 Resiliency.Bulkhead.call(:my_bulkhead, fn -> :work end, max_wait: 1_000)
+```
+
+### RateLimiter
+
+```elixir
+# Start under a supervisor — 100 req/s with burst of 10
+children = [{Resiliency.RateLimiter, name: :my_rate_limiter, rate: 100.0, burst_size: 10}]
+Supervisor.start_link(children, strategy: :one_for_one)
+
+# Basic call — rejects with retry hint when bucket is empty
+case Resiliency.RateLimiter.call(:my_rate_limiter, fn -> HttpClient.get(url) end) do
+  {:ok, response} -> handle_response(response)
+  {:error, {:rate_limited, retry_after_ms}} -> {:error, {:overloaded, retry_after_ms}}
+  {:error, reason} -> {:error, reason}
+end
+
+# Weighted call — expensive operations consume more tokens
+Resiliency.RateLimiter.call(:my_rate_limiter, fn -> bulk_operation() end, weight: 5)
 ```
 
 ### Telemetry

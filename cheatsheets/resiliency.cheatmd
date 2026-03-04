@@ -563,6 +563,85 @@ Bulkhead.start_link(
 # next queued caller proceeds automatically
 ```
 
+## RateLimiter
+{: .col-2}
+
+### Start
+
+```elixir
+# In supervision tree
+children = [
+  {Resiliency.RateLimiter,
+   name: MyApp.ApiRateLimiter,
+   rate: 100.0,
+   burst_size: 10}
+]
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+### Basic Call
+
+```elixir
+alias Resiliency.RateLimiter
+
+case RateLimiter.call(MyApp.ApiRateLimiter, fn ->
+  HttpClient.get(url)
+end) do
+  {:ok, response} -> handle(response)
+  {:error, {:rate_limited, retry_after_ms}} -> {:error, {:overloaded, retry_after_ms}}
+  {:error, reason} -> {:error, reason}
+end
+```
+
+### Weighted Call
+
+```elixir
+# Default weight: 1 token
+RateLimiter.call(MyApp.ApiRateLimiter, fn -> get_one(id) end)
+
+# Expensive operation: 5 tokens
+RateLimiter.call(MyApp.ApiRateLimiter, fn -> bulk_fetch(ids) end, weight: 5)
+```
+
+### On Reject Callback
+
+```elixir
+RateLimiter.start_link(
+  name: MyApp.ApiRateLimiter,
+  rate: 100.0,
+  burst_size: 10,
+  on_reject: fn name ->
+    Logger.warning("#{inspect(name)}: rate limit hit")
+  end
+)
+```
+
+### Get Stats
+
+```elixir
+RateLimiter.get_stats(MyApp.ApiRateLimiter)
+# => %{tokens: 7.3, rate: 100.0, burst_size: 10}
+# Read-only — does not consume tokens or update the timestamp
+```
+
+### Reset
+
+```elixir
+RateLimiter.reset(MyApp.ApiRateLimiter)
+# => :ok  (refills bucket to burst_size)
+```
+
+### Return Values
+
+```elixir
+{:ok, result}                          # granted, fun succeeded
+{:ok, result}                          # bare return auto-wrapped in {:ok, _}
+{:error, {:rate_limited, ms}}          # bucket empty — retry after ms
+{:error, {%RuntimeError{}, stacktrace}} # fun raised
+{:error, :oops}                        # fun exited
+{:error, {:nocatch, value}}            # fun threw
+```
+
 ## WeightedSemaphore
 {: .col-2}
 
