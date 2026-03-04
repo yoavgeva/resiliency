@@ -11,13 +11,12 @@
 
 ### Bug fixes
 
-- `Resiliency.RateLimiter.Server` — duplicate `start_link` with the same name now
-  returns `{:error, {:already_started, pid}}` instead of allowing split-brain state.
-- `Resiliency.RateLimiter.Server` — `terminate/1` now deletes the ETS table before
-  erasing `persistent_term`, preventing a brief window where callers could obtain a
-  dead ETS reference.
-- `Resiliency.RateLimiter.Server` — unknown name now raises a clear `ArgumentError`
-  instead of a `:badarg` crash from `persistent_term.get/1`.
+- Duplicate `start_link` with the same name now returns
+  `{:error, {:already_started, pid}}` instead of allowing split-brain state.
+- `terminate/1` now deletes the ETS table before erasing `persistent_term`,
+  preventing a brief window where callers could obtain a dead ETS reference.
+- Unknown name now raises a clear `ArgumentError` instead of a `:badarg` crash
+  from `persistent_term.get/1`.
 
 ---
 
