@@ -13,10 +13,10 @@ defmodule Resiliency.RateLimiter.Server do
   Returns `{:ok, :granted}` or `{:error, {:rate_limited, retry_after_ms}}`.
   """
   def acquire(name, weight) do
-    {tab, rate, rate_per_ms, burst_size_f, _burst_size, on_reject} = config(name)
+    cfg = config(name)
     # Convert weight to float once at the entry point; avoids two implicit int→float
     # coercions per call (in the >= comparison and the subtraction) inside the hot loop.
-    do_acquire(tab, name, rate, rate_per_ms, burst_size_f, on_reject, weight * 1.0)
+    do_acquire(name, cfg, weight * 1.0)
   end
 
   @doc """
@@ -98,7 +98,13 @@ defmodule Resiliency.RateLimiter.Server do
 
   # CAS retry loop: read → compute refill → attempt select_replace → retry on conflict.
   # weight_f is pre-converted to float by acquire/2 to avoid per-iteration coercions.
-  defp do_acquire(tab, name, rate, rate_per_ms, burst_size_f, on_reject, weight_f, retries \\ 0) do
+  # cfg tuple layout: {tab, rate, rate_per_ms, burst_size_f, burst_size, on_reject}
+  defp do_acquire(
+         name,
+         {tab, _rate, rate_per_ms, burst_size_f, _burst_size, _on_reject} = cfg,
+         weight_f,
+         retries \\ 0
+       ) do
     [{@bucket_key, old_tokens, old_ts}] = :ets.lookup(tab, @bucket_key)
 
     now = System.monotonic_time(:millisecond)
@@ -112,19 +118,7 @@ defmodule Resiliency.RateLimiter.Server do
           {{@bucket_key, old_tokens, old_ts}, [], [{{@bucket_key, new_tokens - weight_f, now}}]}
         ])
 
-      if updated == 1 do
-        {:ok, :granted}
-      else
-        # Another caller won the CAS — retry with fresh state.
-        # The limit of 100 far exceeds the maximum realistic scheduler concurrency
-        # (BEAM schedulers = CPU cores, typically ≤ 64). Hitting it indicates a bug
-        # in the ETS table, not normal high load.
-        if retries >= 100 do
-          raise "rate limiter #{inspect(name)}: CAS retry limit exceeded — pathological contention"
-        end
-
-        do_acquire(tab, name, rate, rate_per_ms, burst_size_f, on_reject, weight_f, retries + 1)
-      end
+      cas_result(updated, name, cfg, weight_f, retries)
     else
       # Rejected — update tokens + timestamp to avoid double-counting elapsed time
       # on the next call. Unlike the grant path, a race here is harmless: if another
@@ -133,11 +127,27 @@ defmodule Resiliency.RateLimiter.Server do
       # spec allocation) rather than select_replace because we don't need CAS semantics.
       :ets.update_element(tab, @bucket_key, [{2, new_tokens}, {3, now}])
 
+      {_tab, rate, _rate_per_ms, _burst_size_f, _burst_size, on_reject} = cfg
       deficit = weight_f - new_tokens
       retry_after_ms = max(1, ceil(deficit / rate * 1000))
       fire_callback(on_reject, name)
       {:error, {:rate_limited, retry_after_ms}}
     end
+  end
+
+  # Handles the result of the CAS attempt in do_acquire.
+  # Another caller won the CAS — retry with fresh state.
+  # The limit of 100 far exceeds the maximum realistic scheduler concurrency
+  # (BEAM schedulers = CPU cores, typically ≤ 64). Hitting it indicates a bug
+  # in the ETS table, not normal high load.
+  defp cas_result(1, _name, _cfg, _weight_f, _retries), do: {:ok, :granted}
+
+  defp cas_result(_, name, cfg, weight_f, retries) do
+    if retries >= 100 do
+      raise "rate limiter #{inspect(name)}: CAS retry limit exceeded — pathological contention"
+    end
+
+    do_acquire(name, cfg, weight_f, retries + 1)
   end
 
   # --- Helpers ---
